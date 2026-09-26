@@ -1,0 +1,65 @@
+"""Validated environment configuration; imports no optional integration packages."""
+
+from dataclasses import dataclass
+import os
+
+MODELS = {
+    "nomic": ("nomic-ai/nomic-embed-text-v1.5", 768),
+    "minilm": ("sentence-transformers/all-MiniLM-L6-v2", 384),
+    "mpnet": ("sentence-transformers/all-mpnet-base-v2", 768),
+}
+DATASETS = ("vidore", "parsebench", "govdocs")
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    database_url: str | None
+    gateway_base_url: str | None
+    gateway_token: str | None
+    chat_endpoints: tuple[str | None, str | None, str | None]
+    seed: int = 7
+    parsebench_max_rows: int = 1000
+    govdocs_max_documents: int = 100
+    govdocs_max_bytes: int = 1_000_000_000
+    hnsw_m: int = 16
+    hnsw_ef_construction: int = 128
+    hnsw_ef_search: int = 40
+
+    @classmethod
+    def from_env(cls, environ: dict[str, str] | None = None) -> "BenchmarkConfig":
+        e = os.environ if environ is None else environ
+
+        def integer(name: str, default: int, minimum: int = 1) -> int:
+            try:
+                value = int(e.get(name, str(default)))
+            except ValueError as exc:
+                raise ValueError(f"{name} must be an integer") from exc
+            if value < minimum:
+                raise ValueError(f"{name} must be >= {minimum}")
+            return value
+
+        return cls(
+            e.get("DATABASE_URL"),
+            e.get("DATABRICKS_BASE_URL"),
+            e.get("DATABRICKS_TOKEN"),
+            tuple(e.get(f"DATABRICKS_CHAT_ENDPOINT_{i}") for i in range(1, 4)),
+            integer("BENCHMARK_SEED", 7, 0),
+            integer("PARSEBENCH_MAX_ROWS", 1000),
+            integer("GOVDOCS_MAX_DOCUMENTS", 100),
+            integer("GOVDOCS_MAX_BYTES", 1),
+            integer("HNSW_M", 16),
+            integer("HNSW_EF_CONSTRUCTION", 128),
+            integer("HNSW_EF_SEARCH", 1),
+        )
+
+    def require_database(self) -> str:
+        if not self.database_url:
+            raise RuntimeError("DATABASE_URL is required for Neon operations")
+        return self.database_url
+
+    def require_gateway(self) -> tuple[str, str, tuple[str, str, str]]:
+        if not self.gateway_base_url or not self.gateway_token or not all(self.chat_endpoints):
+            raise RuntimeError(
+                "DATABRICKS_BASE_URL, DATABRICKS_TOKEN, and all three chat endpoints are required"
+            )
+        return self.gateway_base_url, self.gateway_token, self.chat_endpoints  # type: ignore
