@@ -22,6 +22,7 @@ class PreparedData:
     qrels: dict[str, dict[str, float]] = field(default_factory=dict)
     skipped: list[dict[str, str]] = field(default_factory=list)
     native_qrels: bool = False
+    metadata: dict = field(default_factory=dict)
 
 
 def validate_record(dataset: str, record: dict) -> str:
@@ -145,8 +146,18 @@ def _pdf_payload(value):
     if isinstance(value, dict):
         for key in ("bytes", "data", "content", "path", "filename"):
             if value.get(key) is not None:
-                return value[key]
+                nested = value[key]
+                return _pdf_payload(nested) if isinstance(nested, dict) else nested
     return value
+
+
+def _pdf_size(value) -> int | None:
+    value = _pdf_payload(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value)
+    if isinstance(value, str) and Path(value).is_file():
+        return Path(value).stat().st_size
+    return None
 
 
 def _extract_pdf(
@@ -159,7 +170,7 @@ def _extract_pdf(
     if extractor != "pypdf":
         raise RuntimeError(f"unsupported GOVDOCS_PDF_EXTRACTOR={extractor}; supported: pypdf")
     payload = _pdf_payload(payload)
-    if isinstance(payload, bytes) and len(payload) > max_bytes:
+    if isinstance(payload, (bytes, bytearray, memoryview)) and len(payload) > max_bytes:
         raise ValueError(f"raw PDF exceeds GOVDOCS_MAX_BYTES ({len(payload)} > {max_bytes})")
     if (
         isinstance(payload, str)
@@ -173,14 +184,22 @@ def _extract_pdf(
         from pypdf import PdfReader
     except ImportError as exc:
         raise RuntimeError("GovDocs PDF extraction requires optional dependency pypdf") from exc
-    if isinstance(payload, bytes):
-        reader = PdfReader(BytesIO(payload))
+    if isinstance(payload, (bytes, bytearray, memoryview)):
+        reader = PdfReader(BytesIO(bytes(payload)))
     elif isinstance(payload, str) and Path(payload).is_file():
         reader = PdfReader(payload)
     else:
         raise ValueError("GovDocs PDF field must be bytes, path, or a {bytes,path} object")
-    text = "\n".join((page.extract_text() or "") for page in reader.pages[:max_pages]).strip()
-    return text[:max_text_chars]
+    pieces = []
+    total_chars = 0
+    for page in reader.pages[:max_pages]:
+        piece = page.extract_text() or ""
+        remaining = max_text_chars - total_chars
+        if remaining <= 0:
+            break
+        pieces.append(piece[:remaining])
+        total_chars += len(pieces[-1])
+    return "\n".join(pieces).strip()
 
 
 def _rows(value):
@@ -207,6 +226,7 @@ def prepare_records(
     pdf_extractor: str = "pypdf",
     pdf_max_pages: int = 20,
     pdf_max_text_chars: int = 200_000,
+    pdf_max_document_bytes: int = 100_000_000,
 ) -> PreparedData:
     """Normalize a bounded HF result and record honest skips instead of inventing text/queries."""
     if name not in DATASET_INFO:
@@ -227,16 +247,33 @@ def prepare_records(
                 result.documents.append({"id": doc_id, "text": str(text)})
             else:
                 result.skipped.append({"id": doc_id, "reason": "missing markdown/text"})
+        retained_query_ids = set()
         for row in list(queries)[:max_rows]:
             query_id = str(_get(row, "query_id", "id"))
             text = _get(row, "query", "text")
             if text:
                 result.queries.append({"id": query_id, "text": str(text)})
+                retained_query_ids.add(query_id)
+        qrels_seen = 0
+        qrels_retained = 0
         for row in list(qrel_rows)[:max_rows]:
+            qrels_seen += 1
             query_id = str(_get(row, "query_id"))
             doc_id = str(_get(row, "corpus_id"))
+            if query_id not in retained_query_ids:
+                continue
             result.qrels.setdefault(query_id, {})[doc_id] = float(_get(row, "score") or 0)
+            qrels_retained += 1
         result.native_qrels = bool(result.qrels)
+        result.metadata.update(
+            {
+                "query_count_retained": len(result.queries),
+                "qrels_rows_seen_bounded": qrels_seen,
+                "qrels_rows_retained": qrels_retained,
+                "qrels_coverage": qrels_retained / qrels_seen if qrels_seen else 0.0,
+                "qrels_truncated": len(list(qrel_rows)) > max_rows,
+            }
+        )
     else:
         rows = list(_rows(raw)) if raw is not None else []
         rng = random.Random(seed)
@@ -264,6 +301,7 @@ def prepare_records(
                 )
         else:
             total_bytes = 0
+            raw_pdf_bytes = 0
             for row in rows:
                 if len(result.documents) >= max_documents:
                     break
@@ -273,11 +311,31 @@ def prepare_records(
                     continue
                 payload = _get(row, "text", "content")
                 if not payload:
+                    raw_pdf = _get(row, "pdf", "pdf_bytes")
+                    raw_size = _pdf_size(raw_pdf)
+                    if raw_size is None:
+                        result.skipped.append({"reason": "PDF raw byte size unavailable; excluded"})
+                        continue
+                    if raw_size > pdf_max_document_bytes:
+                        result.skipped.append(
+                            {
+                                "reason": f"per-document raw PDF limit exceeded ({raw_size} > {pdf_max_document_bytes})"
+                            }
+                        )
+                        continue
+                    if raw_pdf_bytes + raw_size > max_bytes:
+                        result.skipped.append(
+                            {
+                                "reason": f"cumulative raw PDF byte budget exhausted ({raw_pdf_bytes} + {raw_size} > {max_bytes})"
+                            }
+                        )
+                        break
+                    raw_pdf_bytes += raw_size
                     try:
                         payload = _extract_pdf(
-                            _get(row, "pdf", "pdf_bytes"),
+                            raw_pdf,
                             pdf_extractor,
-                            max_bytes,
+                            pdf_max_document_bytes,
                             pdf_max_pages,
                             pdf_max_text_chars,
                         )
@@ -295,6 +353,16 @@ def prepare_records(
                 total_bytes += len(payload.encode())
                 doc_id = str(_get(row, "id", "doc_id") or len(result.documents))
                 result.documents.append({"id": doc_id, "text": payload})
+            result.metadata.update(
+                {
+                    "raw_pdf_bytes_consumed": raw_pdf_bytes,
+                    "raw_pdf_byte_budget": max_bytes,
+                    "raw_pdf_budget_exhausted": any(
+                        "cumulative raw PDF byte budget" in item.get("reason", "")
+                        for item in result.skipped
+                    ),
+                }
+            )
             if not query_source:
                 for document in result.documents[: min(10, len(result.documents))]:
                     result.queries.append(

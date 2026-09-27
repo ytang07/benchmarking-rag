@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 from neon_rag_benchmarks.config import BenchmarkConfig, MODELS
 from neon_rag_benchmarks import db
+from neon_rag_benchmarks import pipeline
 from neon_rag_benchmarks.datasets import _extract_pdf, prepare_records, validate_record
 from neon_rag_benchmarks.metrics import answer_metrics, exact_cosine_search, mrr_at_k, recall_at_k
 from neon_rag_benchmarks.pipeline import chunk_text, run_matrix
@@ -76,6 +77,84 @@ def test_vector_and_answer_validation(tmp_path):
     assert validate_record("govdocs", {"id": "x", "broken_pdf": "false"}) == "x"
     with pytest.raises(ValueError):
         validate_record("govdocs", {"id": "x", "broken_pdf": "unknown"})
+
+
+def test_govdocs_cumulative_raw_budget_and_nested_pdf_shape():
+    data = prepare_records(
+        "govdocs",
+        [
+            {"id": "a", "broken_pdf": "false", "pdf": {"data": b"1234"}},
+            {"id": "b", "broken_pdf": 0, "pdf": {"bytes": b"5678"}},
+        ],
+        max_documents=10,
+        max_bytes=5,
+        pdf_max_document_bytes=5,
+    )
+    assert data.metadata["raw_pdf_bytes_consumed"] == 4
+    assert data.metadata["raw_pdf_budget_exhausted"] is True
+    assert any("cumulative raw PDF byte budget" in item["reason"] for item in data.skipped)
+
+
+def test_run_id_is_fresh_even_with_reused_experiment_label():
+    config = BenchmarkConfig.from_env({"EXPERIMENT_ID": "same-label"})
+    first = pipeline.run_matrix(config, smoke=True, persist=False)
+    second = pipeline.run_matrix(config, smoke=True, persist=False)
+    assert {row["run_id"] for row in first}.isdisjoint({row["run_id"] for row in second})
+    assert first[0]["experiment_id"] == second[0]["experiment_id"] == "same-label"
+
+
+def test_connection_is_rolled_back_and_closed_on_pipeline_failure(monkeypatch):
+    class Connection:
+        def __init__(self):
+            self.rolled_back = False
+            self.closed = False
+
+        def rollback(self):
+            self.rolled_back = True
+
+        def close(self):
+            self.closed = True
+
+    connection = Connection()
+    monkeypatch.setattr(db, "connect", lambda _: connection)
+    monkeypatch.setattr(db, "setup", lambda *args: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(pipeline, "embed_texts", lambda texts, model: [[0.0] * 384 for _ in texts])
+    config = BenchmarkConfig.from_env({"DATABASE_URL": "postgres://redacted"})
+    data = pipeline.PreparedData("parsebench", documents=[{"id": "d", "text": "text"}], queries=[])
+    with pytest.raises(RuntimeError, match="boom"):
+        pipeline.run_benchmark(config, data, "minilm", persist=False)
+    assert connection.rolled_back and connection.closed
+
+
+def test_db_cleanup_is_scoped_to_run_id():
+    class Cursor:
+        def __init__(self):
+            self.calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, sql, params):
+            self.calls.append((sql, params))
+
+    class Connection:
+        def __init__(self):
+            self.cursor_obj = Cursor()
+            self.commits = 0
+
+        def cursor(self):
+            return self.cursor_obj
+
+        def commit(self):
+            self.commits += 1
+
+    connection = Connection()
+    db.clear_dataset(connection, "run-a", "vidore", "rag_chunks_minilm")
+    assert connection.cursor_obj.calls[0][1] == ("run-a", "vidore")
+    assert connection.commits == 1
 
 
 def test_insert_rejects_mismatched_batches_without_database():

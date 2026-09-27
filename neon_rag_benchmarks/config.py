@@ -27,6 +27,7 @@ class BenchmarkConfig:
     chunk_size: int = 800
     chunk_overlap: int = 80
     top_k: int = 10
+    exact_scan: bool = True
     qrel_min_score: float = 1.0
     results_path: str = "results/benchmark.jsonl"
     query_source: str | None = None
@@ -35,6 +36,7 @@ class BenchmarkConfig:
     govdocs_split: str = "train"
     govdocs_max_pages: int = 20
     govdocs_max_text_chars: int = 200_000
+    govdocs_max_document_bytes: int = 100_000_000
     experiment_id: str | None = None
 
     @classmethod
@@ -67,6 +69,9 @@ class BenchmarkConfig:
         chunk_overlap = integer("CHUNK_OVERLAP", 80, 0)
         if chunk_overlap >= chunk_size:
             raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE")
+        exact_raw = e.get("EXACT_SCAN", "true").strip().lower()
+        if exact_raw not in {"true", "false", "1", "0", "yes", "no"}:
+            raise ValueError("EXACT_SCAN must be true/false")
         return cls(
             e.get("DATABASE_URL"),
             e.get("DATABRICKS_BASE_URL"),
@@ -82,6 +87,7 @@ class BenchmarkConfig:
             chunk_size,
             chunk_overlap,
             integer("TOP_K", 10),
+            exact_raw in {"true", "1", "yes"},
             threshold,
             e.get("RESULTS_PATH", "results/benchmark.jsonl"),
             e.get("QUERY_SOURCE") or None,
@@ -90,6 +96,7 @@ class BenchmarkConfig:
             e.get("GOVDOCS_SPLIT", "train"),
             integer("GOVDOCS_MAX_PAGES", 20),
             integer("GOVDOCS_MAX_TEXT_CHARS", 200_000),
+            integer("GOVDOCS_MAX_DOCUMENT_BYTES", 100_000_000),
             e.get("EXPERIMENT_ID") or None,
         )
 
