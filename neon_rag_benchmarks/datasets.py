@@ -95,17 +95,35 @@ def load_query_source(path: str) -> tuple[list[dict[str, str]], dict[str, dict[s
     source = Path(path)
     if not source.is_file():
         raise FileNotFoundError(f"QUERY_SOURCE does not exist: {path}")
+    object_qrels = {}
     if source.suffix.lower() == ".csv":
         rows = list(csv.DictReader(source.open(encoding="utf-8", newline="")))
     elif source.suffix.lower() in {".jsonl", ".ndjson", ".json"}:
-        rows = [
-            json.loads(line)
-            for line in source.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        parsed = (
+            json.loads(source.read_text(encoding="utf-8")) if source.suffix == ".json" else None
+        )
+        if isinstance(parsed, dict) and "queries" in parsed:
+            rows = parsed["queries"]
+            object_qrels = parsed.get("qrels", {})
+        elif isinstance(parsed, list):
+            rows, object_qrels = parsed, {}
+        elif parsed is not None:
+            raise ValueError("JSON query source must be an array or an object with queries/qrels")
+        else:
+            rows = [
+                json.loads(line)
+                for line in source.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            object_qrels = {}
     else:
         raise ValueError("QUERY_SOURCE must be .jsonl, .ndjson, or .csv")
     queries, qrels = [], {}
+    for query_id, values in object_qrels.items():
+        if isinstance(values, dict):
+            qrels[str(query_id)] = {str(doc_id): float(score) for doc_id, score in values.items()}
+        else:
+            qrels[str(query_id)] = {str(doc_id): 1.0 for doc_id in values}
     for row in rows:
         query_id = str(row.get("query_id", "")).strip()
         text = str(row.get("text", "")).strip()
@@ -240,7 +258,10 @@ def prepare_records(
         corpus = _rows(raw["corpus"])
         queries = _rows(raw["queries"])
         qrel_rows = _rows(raw["qrels"])
-        for row in list(corpus)[:max_rows]:
+        corpus_rows = list(corpus)
+        query_rows = list(queries)
+        qrel_rows = list(qrel_rows)
+        for row in corpus_rows[:max_rows]:
             doc_id = str(_get(row, "corpus_id", "id", "doc_id"))
             text = _get(row, "markdown", "text", "content")
             if text:
@@ -248,7 +269,7 @@ def prepare_records(
             else:
                 result.skipped.append({"id": doc_id, "reason": "missing markdown/text"})
         retained_query_ids = set()
-        for row in list(queries)[:max_rows]:
+        for row in query_rows[:max_rows]:
             query_id = str(_get(row, "query_id", "id"))
             text = _get(row, "query", "text")
             if text:
@@ -256,7 +277,7 @@ def prepare_records(
                 retained_query_ids.add(query_id)
         qrels_seen = 0
         qrels_retained = 0
-        for row in list(qrel_rows)[:max_rows]:
+        for row in qrel_rows:
             qrels_seen += 1
             query_id = str(_get(row, "query_id"))
             doc_id = str(_get(row, "corpus_id"))
@@ -268,11 +289,20 @@ def prepare_records(
         result.metadata.update(
             {
                 "query_count_retained": len(result.queries),
-                "qrels_rows_seen_bounded": qrels_seen,
+                "qrels_rows_seen": qrels_seen,
                 "qrels_rows_retained": qrels_retained,
                 "qrels_coverage": qrels_retained / qrels_seen if qrels_seen else 0.0,
-                "qrels_truncated": len(list(qrel_rows)) > max_rows,
+                "qrels_truncated": False,
+                "corpus_count_total": len(corpus_rows),
+                "query_count_total": len(query_rows),
+                "corpus_truncated": len(corpus_rows) > max_rows,
+                "query_truncated": len(query_rows) > max_rows,
             }
+        )
+        result.metadata["evaluation_scope"] = (
+            "bounded_sample"
+            if result.metadata["corpus_truncated"] or result.metadata["query_truncated"]
+            else "full_dataset"
         )
     else:
         rows = list(_rows(raw)) if raw is not None else []

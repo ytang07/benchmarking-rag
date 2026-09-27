@@ -47,7 +47,7 @@ def test_offline_matrix_executes_all_dataset_model_paths(tmp_path):
     results = run_matrix(config, smoke=True, persist=True)
     assert len(results) == 27
     assert all(row["status"] == "ok" for row in results)
-    assert results[0]["retrieval_metrics"]["hnsw_recall@k"] == 1.0
+    assert results[0]["retrieval_metrics"]["native_hnsw_recall@k"] == 1.0
     assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 27
     assert len({row["run_id"] for row in results}) == 1
     assert {row["chat_endpoint_env"] for row in results} == {
@@ -72,6 +72,14 @@ def test_vector_and_answer_validation(tmp_path):
         "parsebench", [{"id": "d1", "text_content": "text"}], query_source=str(source)
     )
     assert data.queries[0]["id"] == "q1" and set(data.qrels["q1"]) == {"d1", "d2"}
+    object_source = tmp_path / "queries.json"
+    object_source.write_text(
+        '{"queries":[{"query_id":"q2","text":"Why?"}],"qrels":{"q2":{"d3":2}}}'
+    )
+    object_data = prepare_records(
+        "parsebench", [{"id": "d3", "text_content": "text"}], query_source=str(object_source)
+    )
+    assert object_data.qrels == {"q2": {"d3": 2.0}}
     with pytest.raises(ValueError, match="raw PDF exceeds"):
         _extract_pdf({"bytes": b"too large"}, max_bytes=2)
     assert validate_record("govdocs", {"id": "x", "broken_pdf": "false"}) == "x"
@@ -117,6 +125,7 @@ def test_connection_is_rolled_back_and_closed_on_pipeline_failure(monkeypatch):
 
     connection = Connection()
     monkeypatch.setattr(db, "connect", lambda _: connection)
+    monkeypatch.setattr(db, "table_exists", lambda *args: False)
     monkeypatch.setattr(db, "setup", lambda *args: (_ for _ in ()).throw(RuntimeError("boom")))
     monkeypatch.setattr(pipeline, "embed_texts", lambda texts, model: [[0.0] * 384 for _ in texts])
     config = BenchmarkConfig.from_env({"DATABASE_URL": "postgres://redacted"})
@@ -155,6 +164,61 @@ def test_db_cleanup_is_scoped_to_run_id():
     db.clear_dataset(connection, "run-a", "vidore", "rag_chunks_minilm")
     assert connection.cursor_obj.calls[0][1] == ("run-a", "vidore")
     assert connection.commits == 1
+
+
+def test_existing_schema_must_have_expected_vector_and_hnsw_cosine_index():
+    class Cursor:
+        def __init__(self, columns, indexes):
+            self.columns, self.indexes, self.calls = columns, indexes, []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, sql, params):
+            self.calls.append((sql, params))
+
+        def fetchall(self):
+            return self.columns if len(self.calls) == 1 else self.indexes
+
+    class Connection:
+        def __init__(self, columns, indexes):
+            self.cursor_obj = Cursor(columns, indexes)
+
+        def cursor(self):
+            return self.cursor_obj
+
+    columns = [
+        (name, "vector(384)" if name == "embedding" else "text")
+        for name in ("run_id", "dataset", "doc_id", "content", "embedding")
+    ]
+    good = Connection(columns, [("CREATE INDEX USING hnsw (embedding vector_cosine_ops)",)])
+    db.validate_table_schema(good, "rag_chunks_minilm", 384)
+    bad = Connection(columns, [("CREATE INDEX USING hnsw (embedding vector_l2_ops)",)])
+    with pytest.raises(RuntimeError, match="no HNSW cosine index"):
+        db.validate_table_schema(bad, "rag_chunks_minilm", 384)
+
+
+def test_vidore_bounded_sample_renames_metrics_and_preserves_retained_qrels():
+    raw = {
+        "corpus": [{"id": "d1", "markdown": "one"}, {"id": "d2", "markdown": "two"}],
+        "queries": [{"id": "q1", "query": "one"}, {"id": "q2", "query": "two"}],
+        "qrels": [
+            {"query_id": "q1", "corpus_id": "d1", "score": 1},
+            {"query_id": "q2", "corpus_id": "d2", "score": 1},
+        ],
+    }
+    data = prepare_records("vidore", raw, max_rows=1)
+    assert data.metadata["evaluation_scope"] == "bounded_sample"
+    assert data.qrels == {"q1": {"d1": 1.0}}
+    result = pipeline.run_benchmark(
+        BenchmarkConfig.from_env({}), data, "minilm", smoke=True, persist=False
+    )
+    metrics = result[0]["retrieval_metrics"]
+    assert "bounded_sample_hnsw_recall@k" in metrics
+    assert "native_hnsw_recall@k" not in metrics
 
 
 def test_insert_rejects_mismatched_batches_without_database():

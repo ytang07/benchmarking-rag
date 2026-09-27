@@ -60,6 +60,7 @@ def _skip_records(
             "status": "skipped",
             "reason": reason,
             "skipped": data.skipped,
+            "evaluation_scope": data.metadata.get("evaluation_scope", "not_evaluated"),
             "timing_seconds": {
                 "embedding": 0.0,
                 "ingest": 0.0,
@@ -111,7 +112,10 @@ def _run_benchmark(
     if not smoke:
         if connection is None:
             connection = db.connect(config.require_database())
+        if db.table_exists(connection, table):
+            db.validate_table_schema(connection, table, expected_dimension)
         db.setup(connection, expected_dimension, config.hnsw_m, config.hnsw_ef_construction, table)
+        db.validate_table_schema(connection, table, expected_dimension)
         db.clear_dataset(connection, run_id, data.dataset, table)
         db.insert_chunks(
             connection, data.dataset, chunks, vectors, table, expected_dimension, run_id
@@ -183,10 +187,19 @@ def _run_benchmark(
         exact_eval_ids = [_document_id(doc_id) for doc_id in exact_ids]
         retrieval_metrics = None
         if relevant:
+            metric_prefix = (
+                "native"
+                if data.metadata.get("evaluation_scope", "full_dataset") == "full_dataset"
+                else "bounded_sample"
+            )
             retrieval_metrics = {
-                "hnsw_recall@k": recall_at_k(hnsw_eval_ids, relevant, config.top_k),
-                "hnsw_mrr@k": mrr_at_k(hnsw_eval_ids, relevant, config.top_k),
-                "exact_recall@k": recall_at_k(exact_eval_ids, relevant, config.top_k),
+                f"{metric_prefix}_hnsw_recall@k": recall_at_k(
+                    hnsw_eval_ids, relevant, config.top_k
+                ),
+                f"{metric_prefix}_hnsw_mrr@k": mrr_at_k(hnsw_eval_ids, relevant, config.top_k),
+                f"{metric_prefix}_exact_recall@k": recall_at_k(
+                    exact_eval_ids, relevant, config.top_k
+                ),
             }
         context = "\n\n".join(text for doc_id, text in chunks if doc_id in hnsw_ids)
         phase_seconds = (
@@ -221,6 +234,7 @@ def _run_benchmark(
                 },
                 "qrel_threshold": config.qrel_min_score,
                 "native_qrels": data.native_qrels,
+                "evaluation_scope": data.metadata.get("evaluation_scope", "full_dataset"),
                 "retrieval_metrics": retrieval_metrics,
                 "skipped_count": len(data.skipped),
                 "skipped": data.skipped,
@@ -287,11 +301,13 @@ def run_benchmark(
 def run_matrix(
     config: BenchmarkConfig,
     smoke: bool = False,
-    persist: bool = True,
+    persist: bool | None = None,
     dataset_names: tuple[str, ...] | None = None,
     model_keys: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Execute all 27 dataset/model/endpoint combinations."""
+    if persist is None:
+        persist = config.persist_results
     if not smoke:
         config.require_gateway()
     # EXPERIMENT_ID is a human label; every invocation gets a fresh immutable run id.

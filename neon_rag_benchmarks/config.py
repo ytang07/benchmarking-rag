@@ -30,6 +30,7 @@ class BenchmarkConfig:
     exact_scan: bool = True
     qrel_min_score: float = 1.0
     results_path: str = "results/benchmark.jsonl"
+    persist_results: bool = True
     query_source: str | None = None
     govdocs_pdf_extractor: str = "pypdf"
     govdocs_config: str = "index"
@@ -72,6 +73,9 @@ class BenchmarkConfig:
         exact_raw = e.get("EXACT_SCAN", "true").strip().lower()
         if exact_raw not in {"true", "false", "1", "0", "yes", "no"}:
             raise ValueError("EXACT_SCAN must be true/false")
+        persist_raw = e.get("PERSIST_RESULTS", "true").strip().lower()
+        if persist_raw not in {"true", "false", "1", "0", "yes", "no"}:
+            raise ValueError("PERSIST_RESULTS must be true/false")
         return cls(
             e.get("DATABASE_URL"),
             e.get("DATABRICKS_BASE_URL"),
@@ -90,6 +94,7 @@ class BenchmarkConfig:
             exact_raw in {"true", "1", "yes"},
             threshold,
             e.get("RESULTS_PATH", "results/benchmark.jsonl"),
+            persist_raw in {"true", "1", "yes"},
             e.get("QUERY_SOURCE") or None,
             e.get("GOVDOCS_PDF_EXTRACTOR", "pypdf"),
             e.get("GOVDOCS_CONFIG", "index"),

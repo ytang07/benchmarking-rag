@@ -4,6 +4,45 @@ from .schema import create_schema_sql, search_sql
 from .schema import validate_vectors
 
 
+def validate_table_schema(connection, table: str, dimension: int) -> None:
+    """Fail closed if a preexisting table is not this benchmark's vector schema."""
+    if not table.replace("_", "").isalnum():
+        raise ValueError("invalid table")
+    with connection.cursor() as cur:
+        cur.execute(
+            "SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute "
+            "WHERE attrelid = %s::regclass AND attnum > 0 AND NOT attisdropped",
+            (table,),
+        )
+        columns = {name: str(type_name).lower() for name, type_name in cur.fetchall()}
+        required = {"run_id", "dataset", "doc_id", "content", "embedding"}
+        missing = required - columns.keys()
+        expected_vector = f"vector({dimension})"
+        if missing or columns.get("embedding") != expected_vector:
+            raise RuntimeError(
+                f"incompatible existing table {table}: missing={sorted(missing)}, "
+                f"embedding={columns.get('embedding')!r}, expected={expected_vector!r}"
+            )
+        cur.execute("SELECT indexdef FROM pg_indexes WHERE tablename = %s", (table,))
+        definitions = [str(row[0]).lower() for row in cur.fetchall()]
+        if not any(
+            "using hnsw" in definition and "vector_cosine_ops" in definition
+            for definition in definitions
+        ):
+            raise RuntimeError(
+                f"incompatible existing table {table}: no HNSW cosine index "
+                "(USING hnsw with vector_cosine_ops)"
+            )
+
+
+def table_exists(connection, table: str) -> bool:
+    if not table.replace("_", "").isalnum():
+        raise ValueError("invalid table")
+    with connection.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s)", (table,))
+        return cur.fetchone()[0] is not None
+
+
 def connect(database_url: str):
     try:
         import psycopg
