@@ -90,19 +90,40 @@ def test_vector_and_answer_validation(tmp_path):
 
 
 def test_govdocs_cumulative_raw_budget_and_nested_pdf_shape():
+    from pypdf import PdfWriter
+    import io
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    valid_pdf = buffer.getvalue()
     data = prepare_records(
         "govdocs",
         [
-            {"id": "a", "broken_pdf": "false", "pdf": {"data": b"1234"}},
-            {"id": "b", "broken_pdf": 0, "pdf": {"bytes": b"5678"}},
+            {"id": "a", "broken_pdf": "false", "pdf": {"data": valid_pdf}},
+            {"id": "b", "broken_pdf": 0, "pdf": {"bytes": valid_pdf}},
         ],
         max_documents=10,
-        max_bytes=5,
-        pdf_max_document_bytes=5,
+        max_bytes=len(valid_pdf) + 1,
+        pdf_max_document_bytes=len(valid_pdf) + 1,
     )
-    assert data.metadata["raw_pdf_bytes_consumed"] == 4
+    assert data.metadata["raw_pdf_bytes_consumed"] == len(valid_pdf)
     assert data.metadata["raw_pdf_budget_exhausted"] is True
     assert any("cumulative raw PDF byte budget" in item["reason"] for item in data.skipped)
+
+
+def test_malformed_pdf_is_a_stable_document_skip():
+    data = prepare_records(
+        "govdocs",
+        [{"id": "bad", "broken_pdf": False, "pdf": {"bytes": b"not pdf"}}],
+        max_bytes=100,
+        pdf_max_document_bytes=100,
+    )
+    assert any(
+        item["id"] == "bad" and item["reason"].startswith("malformed PDF bytes")
+        for item in data.skipped
+    )
 
 
 def test_run_id_is_fresh_even_with_reused_experiment_label():

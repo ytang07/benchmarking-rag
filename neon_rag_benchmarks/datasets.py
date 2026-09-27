@@ -204,16 +204,24 @@ def _extract_pdf(
         from pypdf import PdfReader
     except ImportError as exc:
         raise RuntimeError("GovDocs PDF extraction requires optional dependency pypdf") from exc
-    if isinstance(payload, (bytes, bytearray, memoryview)):
-        reader = PdfReader(BytesIO(bytes(payload)))
-    elif isinstance(payload, str) and Path(payload).is_file():
-        reader = PdfReader(payload)
-    else:
-        raise ValueError("GovDocs PDF field must be bytes, path, or a {bytes,path} object")
+    try:
+        if isinstance(payload, (bytes, bytearray, memoryview)):
+            reader = PdfReader(BytesIO(bytes(payload)))
+        elif isinstance(payload, str) and Path(payload).is_file():
+            reader = PdfReader(payload)
+        else:
+            raise ValueError("GovDocs PDF field must be bytes, path, or a {bytes,path} object")
+    except Exception as exc:
+        raise ValueError(f"malformed PDF bytes ({type(exc).__name__})") from exc
     pieces = []
     total_chars = 0
-    for page in reader.pages[:max_pages]:
-        piece = page.extract_text() or ""
+    for page_number, page in enumerate(reader.pages[:max_pages], 1):
+        try:
+            piece = page.extract_text() or ""
+        except Exception as exc:
+            raise ValueError(
+                f"PDF text extraction failed on page {page_number} ({type(exc).__name__})"
+            ) from exc
         remaining = max_text_chars - total_chars
         if remaining <= 0:
             break
