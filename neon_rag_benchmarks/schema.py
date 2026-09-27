@@ -30,7 +30,7 @@ def create_schema_sql(
         raise ValueError("HNSW parameters are invalid")
     return (
         "CREATE EXTENSION IF NOT EXISTS vector",
-        f"CREATE TABLE IF NOT EXISTS {table} (id BIGSERIAL PRIMARY KEY, dataset TEXT NOT NULL, doc_id TEXT NOT NULL, content TEXT NOT NULL, embedding vector({dimension}) NOT NULL)",
+        f"CREATE TABLE IF NOT EXISTS {table} (id BIGSERIAL PRIMARY KEY, run_id TEXT NOT NULL, dataset TEXT NOT NULL, doc_id TEXT NOT NULL, content TEXT NOT NULL, embedding vector({dimension}) NOT NULL)",
         f"CREATE INDEX IF NOT EXISTS {table}_embedding_hnsw ON {table} USING hnsw (embedding vector_cosine_ops) WITH (m = {m}, ef_construction = {ef_construction})",
     )
 

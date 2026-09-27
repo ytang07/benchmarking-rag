@@ -31,6 +31,11 @@ class BenchmarkConfig:
     results_path: str = "results/benchmark.jsonl"
     query_source: str | None = None
     govdocs_pdf_extractor: str = "pypdf"
+    govdocs_config: str = "index"
+    govdocs_split: str = "train"
+    govdocs_max_pages: int = 20
+    govdocs_max_text_chars: int = 200_000
+    experiment_id: str | None = None
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "BenchmarkConfig":
@@ -81,6 +86,11 @@ class BenchmarkConfig:
             e.get("RESULTS_PATH", "results/benchmark.jsonl"),
             e.get("QUERY_SOURCE") or None,
             e.get("GOVDOCS_PDF_EXTRACTOR", "pypdf"),
+            e.get("GOVDOCS_CONFIG", "index"),
+            e.get("GOVDOCS_SPLIT", "train"),
+            integer("GOVDOCS_MAX_PAGES", 20),
+            integer("GOVDOCS_MAX_TEXT_CHARS", 200_000),
+            e.get("EXPERIMENT_ID") or None,
         )
 
     def require_database(self) -> str:

@@ -1,8 +1,9 @@
 import math
+from pathlib import Path
 import pytest
 from neon_rag_benchmarks.config import BenchmarkConfig, MODELS
 from neon_rag_benchmarks import db
-from neon_rag_benchmarks.datasets import prepare_records, validate_record
+from neon_rag_benchmarks.datasets import _extract_pdf, prepare_records, validate_record
 from neon_rag_benchmarks.metrics import answer_metrics, exact_cosine_search, mrr_at_k, recall_at_k
 from neon_rag_benchmarks.pipeline import chunk_text, run_matrix
 from neon_rag_benchmarks.schema import create_schema_sql, validate_dimension, validate_vectors
@@ -47,6 +48,12 @@ def test_offline_matrix_executes_all_dataset_model_paths(tmp_path):
     assert all(row["status"] == "ok" for row in results)
     assert results[0]["retrieval_metrics"]["hnsw_recall@k"] == 1.0
     assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 27
+    assert len({row["run_id"] for row in results}) == 1
+    assert {row["chat_endpoint_env"] for row in results} == {
+        "DATABRICKS_CHAT_ENDPOINT_1",
+        "DATABRICKS_CHAT_ENDPOINT_2",
+        "DATABRICKS_CHAT_ENDPOINT_3",
+    }
 
 
 def test_chunking_is_bounded():
@@ -64,8 +71,22 @@ def test_vector_and_answer_validation(tmp_path):
         "parsebench", [{"id": "d1", "text_content": "text"}], query_source=str(source)
     )
     assert data.queries[0]["id"] == "q1" and set(data.qrels["q1"]) == {"d1", "d2"}
+    with pytest.raises(ValueError, match="raw PDF exceeds"):
+        _extract_pdf({"bytes": b"too large"}, max_bytes=2)
+    assert validate_record("govdocs", {"id": "x", "broken_pdf": "false"}) == "x"
+    with pytest.raises(ValueError):
+        validate_record("govdocs", {"id": "x", "broken_pdf": "unknown"})
 
 
 def test_insert_rejects_mismatched_batches_without_database():
     with pytest.raises(ValueError, match="length mismatch"):
         db.insert_chunks(object(), "smoke", [("d", "text")], [], dimension=2)
+
+
+def test_notebook_offline_execution():
+    nbformat = pytest.importorskip("nbformat")
+    nbclient = pytest.importorskip("nbclient")
+    notebook = Path(__file__).parents[1] / "notebooks" / "benchmark_matrix.ipynb"
+    document = nbformat.read(notebook, as_version=4)
+    nbformat.validate(document)
+    nbclient.NotebookClient(document, timeout=60, kernel_name="python3").execute()

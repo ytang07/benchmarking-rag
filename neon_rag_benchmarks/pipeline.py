@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 from time import perf_counter
+from uuid import uuid4
 
 from . import db
 from .config import BenchmarkConfig, MODELS
@@ -46,17 +47,26 @@ def _endpoint_specs(config: BenchmarkConfig):
 
 
 def _skip_records(
-    data: PreparedData, model_key: str, config: BenchmarkConfig, reason: str
+    data: PreparedData, model_key: str, config: BenchmarkConfig, reason: str, run_id: str
 ) -> list[dict]:
     return [
         {
             "dataset": data.dataset,
             "embedding_model": model_key,
+            "run_id": run_id,
             "chat_endpoint_env": env_name,
             "chat_endpoint": endpoint,
             "status": "skipped",
             "reason": reason,
             "skipped": data.skipped,
+            "timing_seconds": {
+                "embedding": 0.0,
+                "ingest": 0.0,
+                "hnsw_search": 0.0,
+                "exact_scan": 0.0,
+                "answer": 0.0,
+                "total": 0.0,
+            },
         }
         for env_name, endpoint in _endpoint_specs(config)
     ]
@@ -68,16 +78,17 @@ def run_benchmark(
     model_key: str,
     smoke: bool = False,
     persist: bool = True,
+    run_id: str | None = None,
 ) -> list[dict]:
     """Run one dataset/model and emit one result per configured endpoint."""
     if model_key not in MODELS:
         raise ValueError(f"Unknown embedding model {model_key}")
+    run_id = run_id or config.experiment_id or str(uuid4())
     if not data.documents:
-        records = _skip_records(data, model_key, config, "no documents after validation")
+        records = _skip_records(data, model_key, config, "no documents after validation", run_id)
         if persist:
             _persist(config.results_path, records)
         return records
-    started = perf_counter()
     chunks = [
         (doc["id"] + f"#chunk-{i}", chunk)
         for doc in data.documents
@@ -98,15 +109,21 @@ def run_benchmark(
     if not smoke:
         connection = db.connect(config.require_database())
         db.setup(connection, expected_dimension, config.hnsw_m, config.hnsw_ef_construction, table)
-        db.clear_dataset(connection, data.dataset, table)
-        db.insert_chunks(connection, data.dataset, chunks, vectors, table, expected_dimension)
+        db.clear_dataset(connection, run_id, data.dataset, table)
+        db.insert_chunks(
+            connection, data.dataset, chunks, vectors, table, expected_dimension, run_id
+        )
     ingest_seconds = perf_counter() - ingest_started
     queries = data.queries or (
         [{"id": "smoke-query", "text": "How does vector retrieval work?"}] if smoke else []
     )
     if not queries:
         records = _skip_records(
-            data, model_key, config, "no queries supplied; provide QUERY_SOURCE for this dataset"
+            data,
+            model_key,
+            config,
+            "no queries supplied; provide QUERY_SOURCE for this dataset",
+            run_id,
         )
         if connection:
             connection.close()
@@ -127,22 +144,30 @@ def run_benchmark(
             hnsw_ids = [item[0] for item in ranked]
             hnsw_scores = [item[1] for item in ranked]
             exact_ids = hnsw_ids
-            hnsw_seconds = query_embedding_seconds
+            hnsw_seconds = 0.0
             exact_seconds = 0.0
+            retrieval_mode = "synthetic_exact_emulation"
         else:
             hnsw_started = perf_counter()
             hnsw_rows = db.search(
-                connection, query_vector, data.dataset, config.top_k, config.hnsw_ef_search, table
+                connection,
+                query_vector,
+                run_id,
+                data.dataset,
+                config.top_k,
+                config.hnsw_ef_search,
+                table,
             )
             hnsw_seconds = perf_counter() - hnsw_started
             hnsw_ids = [row[0] for row in hnsw_rows]
             hnsw_scores = [float(row[2]) for row in hnsw_rows]
             exact_started = perf_counter()
             exact_rows = db.exact_search(
-                connection, query_vector, data.dataset, config.top_k, table
+                connection, query_vector, run_id, data.dataset, config.top_k, table
             )
             exact_seconds = perf_counter() - exact_started
             exact_ids = [row[0] for row in exact_rows]
+            retrieval_mode = "neon_hnsw_and_exact"
         relevant = {
             doc
             for doc, score in data.qrels.get(query["id"], {}).items()
@@ -158,15 +183,24 @@ def run_benchmark(
                 "exact_recall@k": recall_at_k(exact_eval_ids, relevant, config.top_k),
             }
         context = "\n\n".join(text for doc_id, text in chunks if doc_id in hnsw_ids)
+        phase_seconds = (
+            embedding_seconds
+            + query_embedding_seconds
+            + ingest_seconds
+            + hnsw_seconds
+            + exact_seconds
+        )
         for endpoint_env, endpoint in _endpoint_specs(config):
             record = {
                 "dataset": data.dataset,
                 "embedding_model": model_key,
+                "run_id": run_id,
                 "chat_endpoint_env": endpoint_env,
                 "chat_endpoint": endpoint,
                 "query_id": query["id"],
                 "status": "ok",
                 "retrieval": {
+                    "mode": retrieval_mode,
                     "hnsw_top_ids": hnsw_ids,
                     "hnsw_scores": hnsw_scores,
                     "exact_top_ids": exact_ids,
@@ -176,7 +210,7 @@ def run_benchmark(
                     "ingest": ingest_seconds,
                     "hnsw_search": hnsw_seconds,
                     "exact_scan": exact_seconds,
-                    "total": perf_counter() - started,
+                    "total": phase_seconds,
                 },
                 "qrel_threshold": config.qrel_min_score,
                 "native_qrels": data.native_qrels,
@@ -189,6 +223,7 @@ def run_benchmark(
                 record["answer_metrics"]["reason"] = (
                     "gateway endpoint, base URL, or token not configured"
                 )
+                record["timing_seconds"]["answer"] = 0.0
             else:
                 answer_started = perf_counter()
                 try:
@@ -208,6 +243,7 @@ def run_benchmark(
                     )
                     record["answer_metrics"]["reason"] = str(exc)
                 record["timing_seconds"]["answer"] = perf_counter() - answer_started
+            record["timing_seconds"]["total"] = phase_seconds + record["timing_seconds"]["answer"]
             records.append(record)
     if connection:
         connection.close()
@@ -216,12 +252,21 @@ def run_benchmark(
     return records
 
 
-def run_matrix(config: BenchmarkConfig, smoke: bool = False, persist: bool = True) -> list[dict]:
+def run_matrix(
+    config: BenchmarkConfig,
+    smoke: bool = False,
+    persist: bool = True,
+    dataset_names: tuple[str, ...] | None = None,
+    model_keys: tuple[str, ...] | None = None,
+) -> list[dict]:
     """Execute all 27 dataset/model/endpoint combinations."""
     if not smoke:
         config.require_gateway()
+    run_id = config.experiment_id or str(uuid4())
     output = []
-    for dataset_name in ("vidore", "parsebench", "govdocs"):
+    selected_datasets = dataset_names or ("vidore", "parsebench", "govdocs")
+    selected_models = model_keys or tuple(MODELS)
+    for dataset_name in selected_datasets:
         if smoke:
             data = PreparedData(
                 dataset_name,
@@ -231,7 +276,11 @@ def run_matrix(config: BenchmarkConfig, smoke: bool = False, persist: bool = Tru
             )
         else:
             raw = load_optional(
-                dataset_name, config.parsebench_max_rows, config.govdocs_max_documents
+                dataset_name,
+                config.parsebench_max_rows,
+                config.govdocs_max_documents,
+                config.govdocs_config,
+                config.govdocs_split,
             )
             data = prepare_records(
                 dataset_name,
@@ -242,7 +291,11 @@ def run_matrix(config: BenchmarkConfig, smoke: bool = False, persist: bool = Tru
                 config.govdocs_max_bytes,
                 config.query_source,
                 config.govdocs_pdf_extractor,
+                config.govdocs_max_pages,
+                config.govdocs_max_text_chars,
             )
-        for model_key in MODELS:
-            output.extend(run_benchmark(config, data, model_key, smoke=smoke, persist=persist))
+        for model_key in selected_models:
+            output.extend(
+                run_benchmark(config, data, model_key, smoke=smoke, persist=persist, run_id=run_id)
+            )
     return output

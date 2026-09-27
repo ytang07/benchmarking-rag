@@ -31,8 +31,8 @@ def validate_record(dataset: str, record: dict) -> str:
         raise ValueError("Vidore record needs markdown text")
     if dataset == "parsebench" and not record.get("text_content"):
         raise ValueError("ParseBench record needs text_content")
-    if dataset == "govdocs" and record.get("broken_pdf") is True:
-        raise ValueError("GovDocs broken_pdf=true is excluded")
+    if dataset == "govdocs" and _is_broken(record.get("broken_pdf")):
+        raise ValueError("GovDocs broken_pdf must be an explicit false value")
     return str(record.get("id", record.get("doc_id", "")))
 
 
@@ -43,7 +43,13 @@ def smoke_documents() -> list[dict[str, str]]:
     ]
 
 
-def load_optional(name: str, max_rows: int = 1000, max_documents: int = 100):
+def load_optional(
+    name: str,
+    max_rows: int = 1000,
+    max_documents: int = 100,
+    govdocs_config: str = "index",
+    govdocs_split: str = "train",
+):
     """Load a bounded live sample; credentials/network are required by Hugging Face."""
     try:
         from datasets import load_dataset
@@ -65,8 +71,21 @@ def load_optional(name: str, max_rows: int = 1000, max_documents: int = 100):
     if name == "parsebench":
         return load_dataset("llamaindex/ParseBench", "parse-bench", split=f"train[:{max_rows}]")
     if name == "govdocs":
-        # GovDocs provides source PDFs/metadata rather than extracted text; callers must extract text.
-        return load_dataset("BEE-spoke-data/govdocs1-pdf-source", split=f"train[:{max_documents}]")
+        if govdocs_config not in {"index", "sample"}:
+            raise ValueError("GOVDOCS_CONFIG must be one of the documented configs: index, sample")
+        if not govdocs_split:
+            raise ValueError("GOVDOCS_SPLIT must be non-empty")
+        try:
+            return load_dataset(
+                "BEE-spoke-data/govdocs1-pdf-source",
+                govdocs_config,
+                split=f"{govdocs_split}[:{max_documents}]",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "GovDocs loader expects config index or sample and a valid configured split; "
+                f"config={govdocs_config}, split={govdocs_split}: {exc}"
+            ) from exc
     raise ValueError(f"Unknown dataset {name}; choose {tuple(DATASET_INFO)}")
 
 
@@ -106,9 +125,50 @@ def load_query_source(path: str) -> tuple[list[dict[str, str]], dict[str, dict[s
     return queries, qrels
 
 
-def _extract_pdf(payload, extractor: str = "pypdf") -> str:
+def _is_broken(value) -> bool:
+    """Return true for broken/unknown values; only explicit false is accepted."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+    return True
+
+
+def _pdf_payload(value):
+    """Normalize HF PDF feature values (bytes/path or {bytes,path,...}) to one payload."""
+    if isinstance(value, dict):
+        for key in ("bytes", "data", "content", "path", "filename"):
+            if value.get(key) is not None:
+                return value[key]
+    return value
+
+
+def _extract_pdf(
+    payload,
+    extractor: str = "pypdf",
+    max_bytes: int = 1_000_000_000,
+    max_pages: int = 20,
+    max_text_chars: int = 200_000,
+) -> str:
     if extractor != "pypdf":
         raise RuntimeError(f"unsupported GOVDOCS_PDF_EXTRACTOR={extractor}; supported: pypdf")
+    payload = _pdf_payload(payload)
+    if isinstance(payload, bytes) and len(payload) > max_bytes:
+        raise ValueError(f"raw PDF exceeds GOVDOCS_MAX_BYTES ({len(payload)} > {max_bytes})")
+    if (
+        isinstance(payload, str)
+        and Path(payload).is_file()
+        and Path(payload).stat().st_size > max_bytes
+    ):
+        raise ValueError(
+            f"raw PDF exceeds GOVDOCS_MAX_BYTES ({Path(payload).stat().st_size} > {max_bytes})"
+        )
     try:
         from pypdf import PdfReader
     except ImportError as exc:
@@ -118,8 +178,9 @@ def _extract_pdf(payload, extractor: str = "pypdf") -> str:
     elif isinstance(payload, str) and Path(payload).is_file():
         reader = PdfReader(payload)
     else:
-        raise ValueError("GovDocs PDF field must be bytes or a local PDF path")
-    return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+        raise ValueError("GovDocs PDF field must be bytes, path, or a {bytes,path} object")
+    text = "\n".join((page.extract_text() or "") for page in reader.pages[:max_pages]).strip()
+    return text[:max_text_chars]
 
 
 def _rows(value):
@@ -144,6 +205,8 @@ def prepare_records(
     max_bytes: int = 1_000_000_000,
     query_source: str | None = None,
     pdf_extractor: str = "pypdf",
+    pdf_max_pages: int = 20,
+    pdf_max_text_chars: int = 200_000,
 ) -> PreparedData:
     """Normalize a bounded HF result and record honest skips instead of inventing text/queries."""
     if name not in DATASET_INFO:
@@ -197,20 +260,27 @@ def prepare_records(
                         {"id": f"generated-{document['id']}", "text": document["text"][:160]}
                     )
                 result.skipped.append(
-                    {"reason": "no native qrels; generated deterministic queries"}
+                    {"reason": "no native qrels; generated synthetic prefix probes"}
                 )
         else:
             total_bytes = 0
             for row in rows:
                 if len(result.documents) >= max_documents:
                     break
-                if _get(row, "broken_pdf") is True:
-                    result.skipped.append({"reason": "broken_pdf=true"})
+                broken = _get(row, "broken_pdf")
+                if _is_broken(broken):
+                    result.skipped.append({"reason": f"broken_pdf excluded (value={broken!r})"})
                     continue
                 payload = _get(row, "text", "content")
                 if not payload:
                     try:
-                        payload = _extract_pdf(_get(row, "pdf", "pdf_bytes"), pdf_extractor)
+                        payload = _extract_pdf(
+                            _get(row, "pdf", "pdf_bytes"),
+                            pdf_extractor,
+                            max_bytes,
+                            pdf_max_pages,
+                            pdf_max_text_chars,
+                        )
                     except (RuntimeError, ValueError) as exc:
                         result.skipped.append(
                             {"id": str(_get(row, "id", "doc_id")), "reason": str(exc)}
@@ -231,7 +301,7 @@ def prepare_records(
                         {"id": f"generated-{document['id']}", "text": document["text"][:160]}
                     )
                 result.skipped.append(
-                    {"reason": "no native qrels; generated deterministic queries"}
+                    {"reason": "no native qrels; generated synthetic prefix probes"}
                 )
     if query_source:
         result.queries, source_qrels = load_query_source(query_source)

@@ -38,11 +38,11 @@ def setup(
     connection.commit()
 
 
-def clear_dataset(connection, dataset: str, table: str = "rag_chunks") -> None:
+def clear_dataset(connection, run_id: str, dataset: str, table: str = "rag_chunks") -> None:
     if not table.replace("_", "").isalnum():
         raise ValueError("invalid table")
     with connection.cursor() as cur:
-        cur.execute(f"DELETE FROM {table} WHERE dataset = %s", (dataset,))
+        cur.execute(f"DELETE FROM {table} WHERE run_id = %s AND dataset = %s", (run_id, dataset))
     connection.commit()
 
 
@@ -53,6 +53,7 @@ def insert_chunks(
     vectors: list[list[float]],
     table: str = "rag_chunks",
     dimension: int | None = None,
+    run_id: str = "default",
 ) -> None:
     if not table.replace("_", "").isalnum():
         raise ValueError("invalid table")
@@ -62,28 +63,45 @@ def insert_chunks(
         validate_vectors(vectors, dimension)
     with connection.cursor() as cur:
         cur.executemany(
-            f"INSERT INTO {table} (dataset, doc_id, content, embedding) VALUES (%s, %s, %s, %s)",
-            [(dataset, doc_id, text, vector) for (doc_id, text), vector in zip(chunks, vectors)],
+            f"INSERT INTO {table} (run_id, dataset, doc_id, content, embedding) VALUES (%s, %s, %s, %s, %s)",
+            [
+                (run_id, dataset, doc_id, text, vector)
+                for (doc_id, text), vector in zip(chunks, vectors)
+            ],
         )
     connection.commit()
 
 
 def search(
-    connection, vector: list[float], dataset: str, k: int, ef_search: int, table: str = "rag_chunks"
+    connection,
+    vector: list[float],
+    run_id: str,
+    dataset: str,
+    k: int,
+    ef_search: int,
+    table: str = "rag_chunks",
 ):
     with connection.cursor() as cur:
         if ef_search < 1:
             raise ValueError("ef_search must be >= 1")
         # SET does not accept bind parameters; this value is validated as an integer first.
         cur.execute(f"SET LOCAL hnsw.ef_search = {int(ef_search)}")
-        cur.execute(search_sql(table), (vector, dataset, vector, k))
+        cur.execute(
+            search_sql(table).replace("WHERE dataset = %s", "WHERE run_id = %s AND dataset = %s"),
+            (vector, run_id, dataset, vector, k),
+        )
         return cur.fetchall()
 
 
-def exact_search(connection, vector: list[float], dataset: str, k: int, table: str = "rag_chunks"):
+def exact_search(
+    connection, vector: list[float], run_id: str, dataset: str, k: int, table: str = "rag_chunks"
+):
     with connection.cursor() as cur:
         # Force PostgreSQL's exact scan for a fair baseline instead of allowing HNSW.
         cur.execute("SET LOCAL enable_indexscan = off")
         cur.execute("SET LOCAL enable_bitmapscan = off")
-        cur.execute(search_sql(table), (vector, dataset, vector, k))
+        cur.execute(
+            search_sql(table).replace("WHERE dataset = %s", "WHERE run_id = %s AND dataset = %s"),
+            (vector, run_id, dataset, vector, k),
+        )
         return cur.fetchall()
