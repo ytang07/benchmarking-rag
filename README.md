@@ -26,4 +26,6 @@ The reported `timing_seconds.total` is a benchmark-phase total: document embeddi
 
 Vidore native recall/MRR names are emitted only for `evaluation_scope=full_dataset`. When corpus or query sampling truncates coverage, qrels for retained queries are preserved where possible but metrics are explicitly renamed `bounded_sample_*` and must not be compared to full native evaluation.
 
+Vidore corpus and query components are loaded with Hugging Face streaming and a bounded `max_rows + 1` sentinel. Qrels are streamed through to retain all rows for retained query IDs; this may scan the qrels source, but it is not materialized in memory. Truncation and coverage are recorded in `dataset_metadata`.
+
 For reproducibility, pin the requirements and keep downloaded Hugging Face artifacts in a controlled cache. Dataset adapters should be extended with the relevant `datasets` loading configuration when doing full ingestion; the notebook's smoke mode remains the recommended first validation.

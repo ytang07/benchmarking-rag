@@ -60,7 +60,8 @@ def _skip_records(
             "status": "skipped",
             "reason": reason,
             "skipped": data.skipped,
-            "evaluation_scope": data.metadata.get("evaluation_scope", "not_evaluated"),
+            "evaluation_scope": data.evaluation_scope,
+            "native_qrels": data.native_qrels,
             "timing_seconds": {
                 "embedding": 0.0,
                 "ingest": 0.0,
@@ -148,10 +149,12 @@ def _run_benchmark(
             )
             hnsw_ids = [item[0] for item in ranked]
             hnsw_scores = [item[1] for item in ranked]
-            exact_ids = hnsw_ids
+            exact_ids = hnsw_ids if config.exact_scan else []
             hnsw_seconds = 0.0
             exact_seconds = 0.0
-            retrieval_mode = "synthetic_exact_emulation"
+            retrieval_mode = (
+                "synthetic_exact_emulation" if config.exact_scan else "synthetic_retrieval_only"
+            )
         else:
             hnsw_started = perf_counter()
             hnsw_rows = db.search(
@@ -189,18 +192,19 @@ def _run_benchmark(
         if relevant:
             metric_prefix = (
                 "native"
-                if data.metadata.get("evaluation_scope", "full_dataset") == "full_dataset"
-                else "bounded_sample"
+                if data.native_qrels and data.evaluation_scope == "full_dataset"
+                else ("synthetic" if data.evaluation_scope == "synthetic" else "bounded_sample")
             )
             retrieval_metrics = {
                 f"{metric_prefix}_hnsw_recall@k": recall_at_k(
                     hnsw_eval_ids, relevant, config.top_k
                 ),
                 f"{metric_prefix}_hnsw_mrr@k": mrr_at_k(hnsw_eval_ids, relevant, config.top_k),
-                f"{metric_prefix}_exact_recall@k": recall_at_k(
-                    exact_eval_ids, relevant, config.top_k
-                ),
             }
+            if config.exact_scan:
+                retrieval_metrics[f"{metric_prefix}_exact_recall@k"] = recall_at_k(
+                    exact_eval_ids, relevant, config.top_k
+                )
         context = "\n\n".join(text for doc_id, text in chunks if doc_id in hnsw_ids)
         phase_seconds = (
             embedding_seconds
@@ -234,12 +238,14 @@ def _run_benchmark(
                 },
                 "qrel_threshold": config.qrel_min_score,
                 "native_qrels": data.native_qrels,
-                "evaluation_scope": data.metadata.get("evaluation_scope", "full_dataset"),
+                "evaluation_scope": data.evaluation_scope,
                 "retrieval_metrics": retrieval_metrics,
                 "skipped_count": len(data.skipped),
                 "skipped": data.skipped,
                 "dataset_metadata": data.metadata,
             }
+            if not config.exact_scan:
+                record["exact_unavailable_reason"] = "EXACT_SCAN=false"
             if not endpoint or not config.gateway_base_url or not config.gateway_token:
                 record["answer_metrics"] = answer_metrics(
                     "", "skipped", query.get("reference_answer")
@@ -322,6 +328,8 @@ def run_matrix(
                 documents=smoke_documents(),
                 queries=[{"id": "smoke-query", "text": "How does vector retrieval work?"}],
                 qrels={"smoke-query": {"smoke-1": 1.0}},
+                native_qrels=False,
+                evaluation_scope="synthetic",
             )
         else:
             raw = load_optional(

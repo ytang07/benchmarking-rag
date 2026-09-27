@@ -5,6 +5,7 @@ import csv
 import json
 import random
 from io import BytesIO
+from itertools import islice
 from pathlib import Path
 
 DATASET_INFO = {
@@ -22,6 +23,7 @@ class PreparedData:
     qrels: dict[str, dict[str, float]] = field(default_factory=dict)
     skipped: list[dict[str, str]] = field(default_factory=list)
     native_qrels: bool = False
+    evaluation_scope: str = "incomplete"
     metadata: dict = field(default_factory=dict)
 
 
@@ -61,7 +63,7 @@ def load_optional(
         for component in ("corpus", "queries", "qrels"):
             try:
                 components[component] = load_dataset(
-                    "vidore/vidore_v3_industrial", component, split="test"
+                    "vidore/vidore_v3_industrial", component, split="test", streaming=True
                 )
             except Exception as exc:
                 raise RuntimeError(
@@ -258,9 +260,13 @@ def prepare_records(
         corpus = _rows(raw["corpus"])
         queries = _rows(raw["queries"])
         qrel_rows = _rows(raw["qrels"])
-        corpus_rows = list(corpus)
-        query_rows = list(queries)
-        qrel_rows = list(qrel_rows)
+        # Streaming avoids materializing the ~5k-page corpus. The +1 sentinel proves truncation.
+        corpus_rows = list(islice(iter(corpus), max_rows + 1))
+        query_rows = list(islice(iter(queries), max_rows + 1))
+        corpus_truncated = len(corpus_rows) > max_rows
+        query_truncated = len(query_rows) > max_rows
+        corpus_rows = corpus_rows[:max_rows]
+        query_rows = query_rows[:max_rows]
         for row in corpus_rows[:max_rows]:
             doc_id = str(_get(row, "corpus_id", "id", "doc_id"))
             text = _get(row, "markdown", "text", "content")
@@ -295,8 +301,8 @@ def prepare_records(
                 "qrels_truncated": False,
                 "corpus_count_total": len(corpus_rows),
                 "query_count_total": len(query_rows),
-                "corpus_truncated": len(corpus_rows) > max_rows,
-                "query_truncated": len(query_rows) > max_rows,
+                "corpus_truncated": corpus_truncated,
+                "query_truncated": query_truncated,
             }
         )
         result.metadata["evaluation_scope"] = (
@@ -304,6 +310,15 @@ def prepare_records(
             if result.metadata["corpus_truncated"] or result.metadata["query_truncated"]
             else "full_dataset"
         )
+        indexed_ids = {document["id"] for document in result.documents}
+        qrel_doc_ids = {doc_id for qrels in result.qrels.values() for doc_id in qrels}
+        if (
+            set(result.qrels) != retained_query_ids
+            or not qrel_doc_ids.issubset(indexed_ids)
+            or result.skipped
+        ):
+            result.metadata["evaluation_scope"] = "bounded_sample"
+        result.evaluation_scope = result.metadata["evaluation_scope"]
     else:
         rows = list(_rows(raw)) if raw is not None else []
         rng = random.Random(seed)
@@ -329,6 +344,7 @@ def prepare_records(
                 result.skipped.append(
                     {"reason": "no native qrels; generated synthetic prefix probes"}
                 )
+            result.evaluation_scope = "bounded_sample"
         else:
             total_bytes = 0
             raw_pdf_bytes = 0
@@ -401,6 +417,7 @@ def prepare_records(
                 result.skipped.append(
                     {"reason": "no native qrels; generated synthetic prefix probes"}
                 )
+            result.evaluation_scope = "bounded_sample"
     if query_source:
         result.queries, source_qrels = load_query_source(query_source)
         result.qrels.update(source_qrels)

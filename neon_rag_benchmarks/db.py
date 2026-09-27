@@ -10,23 +10,49 @@ def validate_table_schema(connection, table: str, dimension: int) -> None:
         raise ValueError("invalid table")
     with connection.cursor() as cur:
         cur.execute(
-            "SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute "
+            "SELECT attname, format_type(atttypid, atttypmod), attnotnull, attidentity FROM pg_attribute "
             "WHERE attrelid = %s::regclass AND attnum > 0 AND NOT attisdropped",
             (table,),
         )
-        columns = {name: str(type_name).lower() for name, type_name in cur.fetchall()}
-        required = {"run_id", "dataset", "doc_id", "content", "embedding"}
+        rows = cur.fetchall()
+        columns = {row[0]: str(row[1]).lower() for row in rows}
+        not_null = {row[0] for row in rows if row[2]}
+        identities = {row[0] for row in rows if row[3]}
+        required = {"id", "run_id", "dataset", "doc_id", "content", "embedding"}
         missing = required - columns.keys()
         expected_vector = f"vector({dimension})"
-        if missing or columns.get("embedding") != expected_vector:
+        bad_types = {
+            name
+            for name in ("run_id", "dataset", "doc_id", "content")
+            if columns.get(name) not in {"text", "character varying"}
+        }
+        if missing or bad_types or columns.get("embedding") != expected_vector:
             raise RuntimeError(
-                f"incompatible existing table {table}: missing={sorted(missing)}, "
+                f"incompatible existing table {table}: missing={sorted(missing)}, bad_types={sorted(bad_types)}, "
                 f"embedding={columns.get('embedding')!r}, expected={expected_vector!r}"
+            )
+        if not required.issubset(not_null):
+            raise RuntimeError(
+                f"incompatible existing table {table}: required columns must be NOT NULL"
+            )
+        cur.execute(
+            "SELECT c.contype, a.attname FROM pg_constraint c "
+            "JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) "
+            "WHERE c.conrelid = %s::regclass",
+            (table,),
+        )
+        constraints = cur.fetchall()
+        primary_key_columns = {name for kind, name in constraints if kind == "p"}
+        if "id" not in primary_key_columns and "id" not in identities:
+            raise RuntimeError(
+                f"incompatible existing table {table}: id needs a primary key or identity"
             )
         cur.execute("SELECT indexdef FROM pg_indexes WHERE tablename = %s", (table,))
         definitions = [str(row[0]).lower() for row in cur.fetchall()]
         if not any(
-            "using hnsw" in definition and "vector_cosine_ops" in definition
+            "using hnsw" in definition
+            and "vector_cosine_ops" in definition
+            and "embedding" in definition
             for definition in definitions
         ):
             raise RuntimeError(

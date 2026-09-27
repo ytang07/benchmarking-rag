@@ -47,7 +47,9 @@ def test_offline_matrix_executes_all_dataset_model_paths(tmp_path):
     results = run_matrix(config, smoke=True, persist=True)
     assert len(results) == 27
     assert all(row["status"] == "ok" for row in results)
-    assert results[0]["retrieval_metrics"]["native_hnsw_recall@k"] == 1.0
+    assert results[0]["retrieval_metrics"]["synthetic_hnsw_recall@k"] == 1.0
+    assert results[0]["evaluation_scope"] == "synthetic"
+    assert results[0]["native_qrels"] is False
     assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 27
     assert len({row["run_id"] for row in results}) == 1
     assert {row["chat_endpoint_env"] for row in results} == {
@@ -181,7 +183,12 @@ def test_existing_schema_must_have_expected_vector_and_hnsw_cosine_index():
             self.calls.append((sql, params))
 
         def fetchall(self):
-            return self.columns if len(self.calls) == 1 else self.indexes
+            sql = self.calls[-1][0]
+            if "pg_constraint" in sql:
+                return [("p", "id")]
+            if "pg_attribute" in sql:
+                return self.columns
+            return self.indexes
 
     class Connection:
         def __init__(self, columns, indexes):
@@ -191,8 +198,11 @@ def test_existing_schema_must_have_expected_vector_and_hnsw_cosine_index():
             return self.cursor_obj
 
     columns = [
-        (name, "vector(384)" if name == "embedding" else "text")
-        for name in ("run_id", "dataset", "doc_id", "content", "embedding")
+        ("id", "bigint", True, ""),
+        *[
+            (name, "vector(384)" if name == "embedding" else "text", True, "")
+            for name in ("run_id", "dataset", "doc_id", "content", "embedding")
+        ],
     ]
     good = Connection(columns, [("CREATE INDEX USING hnsw (embedding vector_cosine_ops)",)])
     db.validate_table_schema(good, "rag_chunks_minilm", 384)
@@ -212,6 +222,7 @@ def test_vidore_bounded_sample_renames_metrics_and_preserves_retained_qrels():
     }
     data = prepare_records("vidore", raw, max_rows=1)
     assert data.metadata["evaluation_scope"] == "bounded_sample"
+    assert data.evaluation_scope == "bounded_sample" and data.native_qrels is True
     assert data.qrels == {"q1": {"d1": 1.0}}
     result = pipeline.run_benchmark(
         BenchmarkConfig.from_env({}), data, "minilm", smoke=True, persist=False
@@ -219,6 +230,20 @@ def test_vidore_bounded_sample_renames_metrics_and_preserves_retained_qrels():
     metrics = result[0]["retrieval_metrics"]
     assert "bounded_sample_hnsw_recall@k" in metrics
     assert "native_hnsw_recall@k" not in metrics
+
+
+def test_exact_scan_false_does_not_report_unmeasured_exact_metrics():
+    config = BenchmarkConfig.from_env({"EXACT_SCAN": "false"})
+    data = pipeline.PreparedData(
+        "parsebench",
+        documents=[{"id": "d", "text": "text"}],
+        queries=[{"id": "q", "text": "text"}],
+        qrels={"q": {"d": 1.0}},
+        evaluation_scope="bounded_sample",
+    )
+    result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=False)[0]
+    assert "exact_recall@k" not in result["retrieval_metrics"]
+    assert result["exact_unavailable_reason"] == "EXACT_SCAN=false"
 
 
 def test_insert_rejects_mismatched_batches_without_database():
