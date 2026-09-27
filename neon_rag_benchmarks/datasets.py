@@ -243,6 +243,20 @@ def _get(row, *names):
     return None
 
 
+def _reservoir_sample(rows, limit: int, seed: int):
+    """Bound memory for streaming non-Vidore rows while retaining deterministic sampling."""
+    rng = random.Random(seed)
+    sample = []
+    for index, row in enumerate(rows):
+        if index < limit:
+            sample.append(row)
+        else:
+            replacement = rng.randrange(index + 1)
+            if replacement < limit:
+                sample[replacement] = row
+    return sample
+
+
 def prepare_records(
     name: str,
     raw,
@@ -255,6 +269,7 @@ def prepare_records(
     pdf_max_pages: int = 20,
     pdf_max_text_chars: int = 200_000,
     pdf_max_document_bytes: int = 100_000_000,
+    pdf_max_text_bytes: int = 1_000_000,
 ) -> PreparedData:
     """Normalize a bounded HF result and record honest skips instead of inventing text/queries."""
     if name not in DATASET_INFO:
@@ -328,11 +343,9 @@ def prepare_records(
             result.metadata["evaluation_scope"] = "bounded_sample"
         result.evaluation_scope = result.metadata["evaluation_scope"]
     else:
-        rows = list(_rows(raw)) if raw is not None else []
-        rng = random.Random(seed)
-        rng.shuffle(rows)
         if name == "parsebench":
-            for row in rows[:max_rows]:
+            rows = _reservoir_sample(_rows(raw) if raw is not None else (), max_rows, seed)
+            for row in rows:
                 text = _get(row, "text_content")
                 if text:
                     result.documents.append(
@@ -354,7 +367,9 @@ def prepare_records(
                 )
             result.evaluation_scope = "bounded_sample"
         else:
-            total_bytes = 0
+            # GovDocs stays streaming: limits are applied before requesting/parsing the next PDF.
+            rows = _rows(raw) if raw is not None else ()
+            extracted_text_bytes = 0
             raw_pdf_bytes = 0
             for row in rows:
                 if len(result.documents) >= max_documents:
@@ -401,16 +416,23 @@ def prepare_records(
                 if not isinstance(payload, str) or not payload.strip():
                     result.skipped.append({"reason": "PDF extraction produced no text"})
                     continue
-                if total_bytes + len(payload.encode()) > max_bytes:
-                    result.skipped.append({"reason": "max_bytes reached"})
-                    break
-                total_bytes += len(payload.encode())
+                text_size = len(payload.encode())
+                if text_size > pdf_max_text_bytes:
+                    result.skipped.append(
+                        {
+                            "reason": f"extracted text exceeds max bytes ({text_size} > {pdf_max_text_bytes})"
+                        }
+                    )
+                    continue
+                extracted_text_bytes += text_size
                 doc_id = str(_get(row, "id", "doc_id") or len(result.documents))
                 result.documents.append({"id": doc_id, "text": payload})
             result.metadata.update(
                 {
                     "raw_pdf_bytes_consumed": raw_pdf_bytes,
                     "raw_pdf_byte_budget": max_bytes,
+                    "extracted_text_bytes": extracted_text_bytes,
+                    "extracted_text_byte_limit": pdf_max_text_bytes,
                     "raw_pdf_budget_exhausted": any(
                         "cumulative raw PDF byte budget" in item.get("reason", "")
                         for item in result.skipped

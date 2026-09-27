@@ -219,9 +219,9 @@ def test_existing_schema_must_have_expected_vector_and_hnsw_cosine_index():
             return self.cursor_obj
 
     columns = [
-        ("id", "bigint", True, ""),
+        ("id", "bigint", True, "", "nextval('seq'::regclass)"),
         *[
-            (name, "vector(384)" if name == "embedding" else "text", True, "")
+            (name, "vector(384)" if name == "embedding" else "text", True, "", "")
             for name in ("run_id", "dataset", "doc_id", "content", "embedding")
         ],
     ]
@@ -230,6 +230,15 @@ def test_existing_schema_must_have_expected_vector_and_hnsw_cosine_index():
     bad = Connection(columns, [("CREATE INDEX USING hnsw (embedding vector_l2_ops)",)])
     with pytest.raises(RuntimeError, match="no HNSW cosine index"):
         db.validate_table_schema(bad, "rag_chunks_minilm", 384)
+    bad_id_columns = [("id", "text", True, "", "nextval('seq'::regclass)"), *columns[1:]]
+    with pytest.raises(RuntimeError, match="id must be BIGINT"):
+        db.validate_table_schema(
+            Connection(
+                bad_id_columns, [("CREATE INDEX USING hnsw (embedding vector_cosine_ops)",)]
+            ),
+            "rag_chunks_minilm",
+            384,
+        )
 
 
 def test_vidore_bounded_sample_renames_metrics_and_preserves_retained_qrels():

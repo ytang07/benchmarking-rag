@@ -10,14 +10,17 @@ def validate_table_schema(connection, table: str, dimension: int) -> None:
         raise ValueError("invalid table")
     with connection.cursor() as cur:
         cur.execute(
-            "SELECT attname, format_type(atttypid, atttypmod), attnotnull, attidentity FROM pg_attribute "
-            "WHERE attrelid = %s::regclass AND attnum > 0 AND NOT attisdropped",
+            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attidentity, "
+            "pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a "
+            "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+            "WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped",
             (table,),
         )
         rows = cur.fetchall()
         columns = {row[0]: str(row[1]).lower() for row in rows}
         not_null = {row[0] for row in rows if row[2]}
         identities = {row[0] for row in rows if row[3]}
+        defaults = {row[0]: str(row[4] or "").lower() for row in rows}
         required = {"id", "run_id", "dataset", "doc_id", "content", "embedding"}
         missing = required - columns.keys()
         expected_vector = f"vector({dimension})"
@@ -43,9 +46,10 @@ def validate_table_schema(connection, table: str, dimension: int) -> None:
         )
         constraints = cur.fetchall()
         primary_key_columns = {name for kind, name in constraints if kind == "p"}
-        if "id" not in primary_key_columns and "id" not in identities:
+        id_generated = "id" in identities or "nextval(" in defaults.get("id", "")
+        if columns.get("id") != "bigint" or "id" not in primary_key_columns or not id_generated:
             raise RuntimeError(
-                f"incompatible existing table {table}: id needs a primary key or identity"
+                f"incompatible existing table {table}: id must be BIGINT with a sequence/identity default and primary key"
             )
         cur.execute("SELECT indexdef FROM pg_indexes WHERE tablename = %s", (table,))
         definitions = [str(row[0]).lower() for row in cur.fetchall()]

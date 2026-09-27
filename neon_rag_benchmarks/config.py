@@ -38,6 +38,7 @@ class BenchmarkConfig:
     govdocs_max_pages: int = 20
     govdocs_max_text_chars: int = 200_000
     govdocs_max_document_bytes: int = 100_000_000
+    govdocs_max_text_bytes: int = 1_000_000
     experiment_id: str | None = None
 
     @classmethod
@@ -102,6 +103,7 @@ class BenchmarkConfig:
             integer("GOVDOCS_MAX_PAGES", 20),
             integer("GOVDOCS_MAX_TEXT_CHARS", 200_000),
             integer("GOVDOCS_MAX_DOCUMENT_BYTES", 100_000_000),
+            integer("GOVDOCS_MAX_TEXT_BYTES", 1_000_000),
             e.get("EXPERIMENT_ID") or None,
         )
 

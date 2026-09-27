@@ -64,6 +64,8 @@ def _skip_records(
             "native_qrels": data.native_qrels,
             "timing_seconds": {
                 "embedding": 0.0,
+                "corpus_embedding": 0.0,
+                "query_embedding": 0.0,
                 "ingest": 0.0,
                 "hnsw_search": 0.0,
                 "exact_scan": 0.0,
@@ -231,6 +233,8 @@ def _run_benchmark(
                 },
                 "timing_seconds": {
                     "embedding": embedding_seconds + query_embedding_seconds,
+                    "corpus_embedding": embedding_seconds,
+                    "query_embedding": query_embedding_seconds,
                     "ingest": ingest_seconds,
                     "hnsw_search": hnsw_seconds,
                     "exact_scan": exact_seconds,
@@ -351,6 +355,7 @@ def run_matrix(
                 config.govdocs_max_pages,
                 config.govdocs_max_text_chars,
                 config.govdocs_max_document_bytes,
+                config.govdocs_max_text_bytes,
             )
         for model_key in selected_models:
             output.extend(
