@@ -29,6 +29,8 @@ class BenchmarkConfig:
     top_k: int = 10
     qrel_min_score: float = 1.0
     results_path: str = "results/benchmark.jsonl"
+    query_source: str | None = None
+    govdocs_pdf_extractor: str = "pypdf"
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "BenchmarkConfig":
@@ -77,6 +79,8 @@ class BenchmarkConfig:
             integer("TOP_K", 10),
             threshold,
             e.get("RESULTS_PATH", "results/benchmark.jsonl"),
+            e.get("QUERY_SOURCE") or None,
+            e.get("GOVDOCS_PDF_EXTRACTOR", "pypdf"),
         )
 
     def require_database(self) -> str:

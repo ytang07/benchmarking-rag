@@ -1,6 +1,7 @@
 """Optional Neon/pgvector persistence."""
 
 from .schema import create_schema_sql, search_sql
+from .schema import validate_vectors
 
 
 def connect(database_url: str):
@@ -10,12 +11,19 @@ def connect(database_url: str):
         raise RuntimeError("Install the full extra for Neon") from exc
     connection = psycopg.connect(database_url)
     try:
+        with connection.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        connection.commit()
         from pgvector.psycopg import register_vector
 
         register_vector(connection)
     except ImportError as exc:
         connection.close()
         raise RuntimeError("Install pgvector to register vector parameters with psycopg") from exc
+    except Exception:
+        connection.rollback()
+        connection.close()
+        raise
     return connection
 
 
@@ -30,15 +38,28 @@ def setup(
     connection.commit()
 
 
+def clear_dataset(connection, dataset: str, table: str = "rag_chunks") -> None:
+    if not table.replace("_", "").isalnum():
+        raise ValueError("invalid table")
+    with connection.cursor() as cur:
+        cur.execute(f"DELETE FROM {table} WHERE dataset = %s", (dataset,))
+    connection.commit()
+
+
 def insert_chunks(
     connection,
     dataset: str,
     chunks: list[tuple[str, str]],
     vectors: list[list[float]],
     table: str = "rag_chunks",
+    dimension: int | None = None,
 ) -> None:
     if not table.replace("_", "").isalnum():
         raise ValueError("invalid table")
+    if len(chunks) != len(vectors):
+        raise ValueError(f"chunks/vectors length mismatch: {len(chunks)} != {len(vectors)}")
+    if dimension is not None:
+        validate_vectors(vectors, dimension)
     with connection.cursor() as cur:
         cur.executemany(
             f"INSERT INTO {table} (dataset, doc_id, content, embedding) VALUES (%s, %s, %s, %s)",

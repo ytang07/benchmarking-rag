@@ -1,10 +1,11 @@
 import math
 import pytest
 from neon_rag_benchmarks.config import BenchmarkConfig, MODELS
-from neon_rag_benchmarks.datasets import validate_record
-from neon_rag_benchmarks.metrics import exact_cosine_search, mrr_at_k, recall_at_k
+from neon_rag_benchmarks import db
+from neon_rag_benchmarks.datasets import prepare_records, validate_record
+from neon_rag_benchmarks.metrics import answer_metrics, exact_cosine_search, mrr_at_k, recall_at_k
 from neon_rag_benchmarks.pipeline import chunk_text, run_matrix
-from neon_rag_benchmarks.schema import create_schema_sql, validate_dimension
+from neon_rag_benchmarks.schema import create_schema_sql, validate_dimension, validate_vectors
 from neon_rag_benchmarks.smoke import run_smoke
 
 
@@ -42,11 +43,29 @@ def test_offline_smoke():
 def test_offline_matrix_executes_all_dataset_model_paths(tmp_path):
     config = BenchmarkConfig.from_env({"RESULTS_PATH": str(tmp_path / "results.jsonl")})
     results = run_matrix(config, smoke=True, persist=True)
-    assert len(results) == 9
+    assert len(results) == 27
     assert all(row["status"] == "ok" for row in results)
     assert results[0]["retrieval_metrics"]["hnsw_recall@k"] == 1.0
-    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 9
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 27
 
 
 def test_chunking_is_bounded():
     assert chunk_text("abcdefgh", size=4, overlap=1) == ["abcd", "defg", "gh"]
+
+
+def test_vector_and_answer_validation(tmp_path):
+    with pytest.raises(ValueError):
+        validate_vectors([[1.0]], 2)
+    result = answer_metrics("A correct answer!", "ok", "a correct answer")
+    assert result["normalized_exact_match"] is True
+    source = tmp_path / "queries.jsonl"
+    source.write_text('{"query_id":"q1","text":"What?","relevant_doc_ids":"d1,d2"}\n')
+    data = prepare_records(
+        "parsebench", [{"id": "d1", "text_content": "text"}], query_source=str(source)
+    )
+    assert data.queries[0]["id"] == "q1" and set(data.qrels["q1"]) == {"d1", "d2"}
+
+
+def test_insert_rejects_mismatched_batches_without_database():
+    with pytest.raises(ValueError, match="length mismatch"):
+        db.insert_chunks(object(), "smoke", [("d", "text")], [], dimension=2)

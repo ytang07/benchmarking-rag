@@ -1,7 +1,11 @@
 """Dataset adapters. Only Vidore supplies native qrels; other datasets require queries."""
 
 from dataclasses import dataclass, field
+import csv
+import json
 import random
+from io import BytesIO
+from pathlib import Path
 
 DATASET_INFO = {
     "vidore": "vidore/vidore_v3_industrial: corpus/test markdown, queries/test query, qrels/test query_id/corpus_id/score; native qrels.",
@@ -46,13 +50,76 @@ def load_optional(name: str, max_rows: int = 1000, max_documents: int = 100):
     except ImportError as exc:
         raise RuntimeError("Install the full extra to load Hugging Face datasets") from exc
     if name == "vidore":
-        return load_dataset("vidore/vidore_v3_industrial", trust_remote_code=True)
+        components = {}
+        for component in ("corpus", "queries", "qrels"):
+            try:
+                components[component] = load_dataset(
+                    "vidore/vidore_v3_industrial", component, split="test"
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Vidore must expose configs corpus/queries/qrels with test splits; "
+                    f"could not load config={component}, split=test: {exc}"
+                ) from exc
+        return components
     if name == "parsebench":
         return load_dataset("llamaindex/ParseBench", "parse-bench", split=f"train[:{max_rows}]")
     if name == "govdocs":
         # GovDocs provides source PDFs/metadata rather than extracted text; callers must extract text.
         return load_dataset("BEE-spoke-data/govdocs1-pdf-source", split=f"train[:{max_documents}]")
     raise ValueError(f"Unknown dataset {name}; choose {tuple(DATASET_INFO)}")
+
+
+def load_query_source(path: str) -> tuple[list[dict[str, str]], dict[str, dict[str, float]]]:
+    """Read query_id/text and optional reference_answer/qrels from JSONL or CSV."""
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"QUERY_SOURCE does not exist: {path}")
+    if source.suffix.lower() == ".csv":
+        rows = list(csv.DictReader(source.open(encoding="utf-8", newline="")))
+    elif source.suffix.lower() in {".jsonl", ".ndjson", ".json"}:
+        rows = [
+            json.loads(line)
+            for line in source.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    else:
+        raise ValueError("QUERY_SOURCE must be .jsonl, .ndjson, or .csv")
+    queries, qrels = [], {}
+    for row in rows:
+        query_id = str(row.get("query_id", "")).strip()
+        text = str(row.get("text", "")).strip()
+        if not query_id or not text:
+            raise ValueError("every query source row needs non-empty query_id and text")
+        query = {"id": query_id, "text": text}
+        if row.get("reference_answer"):
+            query["reference_answer"] = str(row["reference_answer"])
+        queries.append(query)
+        raw_qrels = row.get("qrels", row.get("relevant_doc_ids", ""))
+        if raw_qrels:
+            ids = (
+                raw_qrels
+                if isinstance(raw_qrels, list)
+                else str(raw_qrels).replace(";", ",").split(",")
+            )
+            qrels[query_id] = {str(doc_id).strip(): 1.0 for doc_id in ids if str(doc_id).strip()}
+    return queries, qrels
+
+
+def _extract_pdf(payload, extractor: str = "pypdf") -> str:
+    if extractor != "pypdf":
+        raise RuntimeError(f"unsupported GOVDOCS_PDF_EXTRACTOR={extractor}; supported: pypdf")
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise RuntimeError("GovDocs PDF extraction requires optional dependency pypdf") from exc
+    if isinstance(payload, bytes):
+        reader = PdfReader(BytesIO(payload))
+    elif isinstance(payload, str) and Path(payload).is_file():
+        reader = PdfReader(payload)
+    else:
+        raise ValueError("GovDocs PDF field must be bytes or a local PDF path")
+    return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
 
 
 def _rows(value):
@@ -75,15 +142,21 @@ def prepare_records(
     max_rows: int = 1000,
     max_documents: int = 100,
     max_bytes: int = 1_000_000_000,
+    query_source: str | None = None,
+    pdf_extractor: str = "pypdf",
 ) -> PreparedData:
     """Normalize a bounded HF result and record honest skips instead of inventing text/queries."""
     if name not in DATASET_INFO:
         raise ValueError(f"Unknown dataset {name}; choose {tuple(DATASET_INFO)}")
     result = PreparedData(name)
     if name == "vidore":
-        corpus = _rows(raw.get("corpus", raw)) if isinstance(raw, dict) else raw
-        queries = _rows(raw.get("queries", [])) if isinstance(raw, dict) else []
-        qrel_rows = _rows(raw.get("qrels", [])) if isinstance(raw, dict) else []
+        if not isinstance(raw, dict) or not all(
+            key in raw for key in ("corpus", "queries", "qrels")
+        ):
+            raise RuntimeError("Vidore loader returned no corpus/queries/qrels test components")
+        corpus = _rows(raw["corpus"])
+        queries = _rows(raw["queries"])
+        qrel_rows = _rows(raw["qrels"])
         for row in list(corpus)[:max_rows]:
             doc_id = str(_get(row, "corpus_id", "id", "doc_id"))
             text = _get(row, "markdown", "text", "content")
@@ -96,50 +169,72 @@ def prepare_records(
             text = _get(row, "query", "text")
             if text:
                 result.queries.append({"id": query_id, "text": str(text)})
-        for row in list(qrel_rows):
+        for row in list(qrel_rows)[:max_rows]:
             query_id = str(_get(row, "query_id"))
             doc_id = str(_get(row, "corpus_id"))
             result.qrels.setdefault(query_id, {})[doc_id] = float(_get(row, "score") or 0)
         result.native_qrels = bool(result.qrels)
-        return result
-    rows = list(_rows(raw)) if raw is not None else []
-    rng = random.Random(seed)
-    rng.shuffle(rows)
-    if name == "parsebench":
-        for row in rows[:max_rows]:
-            text = _get(row, "text_content")
-            if text:
-                result.documents.append(
-                    {
-                        "id": str(_get(row, "id", "document_id") or len(result.documents)),
-                        "text": str(text),
-                    }
+    else:
+        rows = list(_rows(raw)) if raw is not None else []
+        rng = random.Random(seed)
+        rng.shuffle(rows)
+        if name == "parsebench":
+            for row in rows[:max_rows]:
+                text = _get(row, "text_content")
+                if text:
+                    result.documents.append(
+                        {
+                            "id": str(_get(row, "id", "document_id") or len(result.documents)),
+                            "text": str(text),
+                        }
+                    )
+                else:
+                    result.skipped.append({"reason": "missing text_content"})
+            if not query_source:
+                # ParseBench has useful text but no native queries: deterministic first-sentence queries are explicit fallback.
+                for document in result.documents[: min(10, len(result.documents))]:
+                    result.queries.append(
+                        {"id": f"generated-{document['id']}", "text": document["text"][:160]}
+                    )
+                result.skipped.append(
+                    {"reason": "no native qrels; generated deterministic queries"}
                 )
-            else:
-                result.skipped.append({"reason": "missing text_content"})
-        result.skipped.append(
-            {"reason": "no native queries/qrels; provide generated or user queries"}
-        )
-        return result
-    total_bytes = 0
-    for row in rows:
-        if len(result.documents) >= max_documents:
-            break
-        if _get(row, "broken_pdf") is True:
-            result.skipped.append({"reason": "broken_pdf=true"})
-            continue
-        payload = _get(row, "text", "content", "pdf")
-        if not isinstance(payload, str):
-            result.skipped.append(
-                {"id": str(_get(row, "id", "doc_id")), "reason": "PDF has no extracted text"}
-            )
-            continue
-        if total_bytes + len(payload.encode()) > max_bytes:
-            result.skipped.append({"reason": "max_bytes reached"})
-            break
-        total_bytes += len(payload.encode())
-        result.documents.append(
-            {"id": str(_get(row, "id", "doc_id") or len(result.documents)), "text": payload}
-        )
-    result.skipped.append({"reason": "no native queries/qrels; provide generated or user queries"})
+        else:
+            total_bytes = 0
+            for row in rows:
+                if len(result.documents) >= max_documents:
+                    break
+                if _get(row, "broken_pdf") is True:
+                    result.skipped.append({"reason": "broken_pdf=true"})
+                    continue
+                payload = _get(row, "text", "content")
+                if not payload:
+                    try:
+                        payload = _extract_pdf(_get(row, "pdf", "pdf_bytes"), pdf_extractor)
+                    except (RuntimeError, ValueError) as exc:
+                        result.skipped.append(
+                            {"id": str(_get(row, "id", "doc_id")), "reason": str(exc)}
+                        )
+                        continue
+                if not isinstance(payload, str) or not payload.strip():
+                    result.skipped.append({"reason": "PDF extraction produced no text"})
+                    continue
+                if total_bytes + len(payload.encode()) > max_bytes:
+                    result.skipped.append({"reason": "max_bytes reached"})
+                    break
+                total_bytes += len(payload.encode())
+                doc_id = str(_get(row, "id", "doc_id") or len(result.documents))
+                result.documents.append({"id": doc_id, "text": payload})
+            if not query_source:
+                for document in result.documents[: min(10, len(result.documents))]:
+                    result.queries.append(
+                        {"id": f"generated-{document['id']}", "text": document["text"][:160]}
+                    )
+                result.skipped.append(
+                    {"reason": "no native qrels; generated deterministic queries"}
+                )
+    if query_source:
+        result.queries, source_qrels = load_query_source(query_source)
+        result.qrels.update(source_qrels)
+        result.skipped.append({"reason": f"queries loaded from {query_source}"})
     return result

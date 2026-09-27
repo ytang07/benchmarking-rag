@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import math
+import re
 
 
 @dataclass(frozen=True)
@@ -10,6 +11,25 @@ class Timing:
     ingest_seconds: float = 0.0
     search_seconds: float = 0.0
     answer_seconds: float = 0.0
+
+
+def normalized_text(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", value.lower())).strip()
+
+
+def answer_metrics(generated: str, status: str, reference: str | None = None) -> dict:
+    result = {
+        "status": status,
+        "answer_chars": len(generated),
+        "answer_words": len(generated.split()),
+        "quality_metric_support": "reference_match_only; no truth judgment",
+    }
+    if reference is not None:
+        result["normalized_exact_match"] = normalized_text(generated) == normalized_text(reference)
+    else:
+        result["normalized_exact_match"] = None
+        result["quality_metric_note"] = "unsupported_without_reference_answer"
+    return result
 
 
 def recall_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:

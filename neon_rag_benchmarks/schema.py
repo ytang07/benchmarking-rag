@@ -11,6 +11,16 @@ def validate_dimension(model_key: str, dimension: int) -> None:
         raise ValueError(f"{model_key} produces {expected} dimensions, got {dimension}")
 
 
+def validate_vectors(vectors: list[list[float]], expected_dimension: int) -> None:
+    if not vectors:
+        raise ValueError("cannot insert an empty vector batch")
+    for index, vector in enumerate(vectors):
+        if len(vector) != expected_dimension:
+            raise ValueError(
+                f"vector {index} has dimension {len(vector)}; expected {expected_dimension}"
+            )
+
+
 def create_schema_sql(
     dimension: int, table: str = "rag_chunks", m: int = 16, ef_construction: int = 128
 ) -> tuple[str, ...]:
