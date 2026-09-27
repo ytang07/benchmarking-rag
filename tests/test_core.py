@@ -3,6 +3,7 @@ import pytest
 from neon_rag_benchmarks.config import BenchmarkConfig, MODELS
 from neon_rag_benchmarks.datasets import validate_record
 from neon_rag_benchmarks.metrics import exact_cosine_search, mrr_at_k, recall_at_k
+from neon_rag_benchmarks.pipeline import chunk_text, run_matrix
 from neon_rag_benchmarks.schema import create_schema_sql, validate_dimension
 from neon_rag_benchmarks.smoke import run_smoke
 
@@ -36,3 +37,16 @@ def test_dataset_validation():
 def test_offline_smoke():
     result = run_smoke()
     assert result["offline"] is True and result["recall@1"] == 1.0
+
+
+def test_offline_matrix_executes_all_dataset_model_paths(tmp_path):
+    config = BenchmarkConfig.from_env({"RESULTS_PATH": str(tmp_path / "results.jsonl")})
+    results = run_matrix(config, smoke=True, persist=True)
+    assert len(results) == 9
+    assert all(row["status"] == "ok" for row in results)
+    assert results[0]["retrieval_metrics"]["hnsw_recall@k"] == 1.0
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 9
+
+
+def test_chunking_is_bounded():
+    assert chunk_text("abcdefgh", size=4, overlap=1) == ["abcd", "defg", "gh"]

@@ -24,9 +24,21 @@ class BenchmarkConfig:
     hnsw_m: int = 16
     hnsw_ef_construction: int = 128
     hnsw_ef_search: int = 40
+    chunk_size: int = 800
+    chunk_overlap: int = 80
+    top_k: int = 10
+    qrel_min_score: float = 1.0
+    results_path: str = "results/benchmark.jsonl"
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "BenchmarkConfig":
+        if environ is None:
+            try:
+                from dotenv import load_dotenv
+
+                load_dotenv()
+            except ImportError:
+                pass
         e = os.environ if environ is None else environ
 
         def integer(name: str, default: int, minimum: int = 1) -> int:
@@ -38,6 +50,16 @@ class BenchmarkConfig:
                 raise ValueError(f"{name} must be >= {minimum}")
             return value
 
+        try:
+            threshold = float(e.get("QREL_MIN_SCORE", "1"))
+        except ValueError as exc:
+            raise ValueError("QREL_MIN_SCORE must be numeric") from exc
+        if threshold < 0:
+            raise ValueError("QREL_MIN_SCORE must be >= 0")
+        chunk_size = integer("CHUNK_SIZE", 800)
+        chunk_overlap = integer("CHUNK_OVERLAP", 80, 0)
+        if chunk_overlap >= chunk_size:
+            raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE")
         return cls(
             e.get("DATABASE_URL"),
             e.get("DATABRICKS_BASE_URL"),
@@ -50,6 +72,11 @@ class BenchmarkConfig:
             integer("HNSW_M", 16),
             integer("HNSW_EF_CONSTRUCTION", 128),
             integer("HNSW_EF_SEARCH", 1),
+            chunk_size,
+            chunk_overlap,
+            integer("TOP_K", 10),
+            threshold,
+            e.get("RESULTS_PATH", "results/benchmark.jsonl"),
         )
 
     def require_database(self) -> str:
