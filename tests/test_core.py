@@ -45,18 +45,15 @@ def test_offline_smoke():
 def test_offline_matrix_executes_all_dataset_model_paths(tmp_path):
     config = BenchmarkConfig.from_env({"RESULTS_PATH": str(tmp_path / "results.jsonl")})
     results = run_matrix(config, smoke=True, persist=True)
-    assert len(results) == 27
+    assert len(results) == 9
     assert all(row["status"] == "ok" for row in results)
     assert results[0]["retrieval_metrics"]["synthetic_hnsw_recall@k"] == 1.0
     assert results[0]["evaluation_scope"] == "synthetic"
     assert results[0]["native_qrels"] is False
-    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 27
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 9
     assert len({row["run_id"] for row in results}) == 1
-    assert {row["chat_endpoint_env"] for row in results} == {
-        "DATABRICKS_CHAT_ENDPOINT_1",
-        "DATABRICKS_CHAT_ENDPOINT_2",
-        "DATABRICKS_CHAT_ENDPOINT_3",
-    }
+    assert {row["chat_model_env"] for row in results} == {"DATABRICKS_MODEL"}
+    assert {row["chat_model"] for row in results} == {None}
 
 
 def test_chunking_is_bounded():
