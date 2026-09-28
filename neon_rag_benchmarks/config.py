@@ -9,6 +9,7 @@ MODELS = {
     "mpnet": ("sentence-transformers/all-mpnet-base-v2", 768),
 }
 DATASETS = ("vidore", "parsebench", "govdocs")
+DEFAULT_CHAT_MODEL = "system.ai.gpt-oss-120b"
 
 
 @dataclass(frozen=True)
@@ -16,7 +17,7 @@ class BenchmarkConfig:
     database_url: str | None
     gateway_base_url: str | None
     gateway_token: str | None
-    chat_endpoints: tuple[str | None, str | None, str | None]
+    gateway_model: str | None
     seed: int = 7
     parsebench_max_rows: int = 1000
     govdocs_max_documents: int = 100
@@ -81,7 +82,7 @@ class BenchmarkConfig:
             e.get("DATABASE_URL"),
             e.get("DATABRICKS_BASE_URL"),
             e.get("DATABRICKS_TOKEN"),
-            tuple(e.get(f"DATABRICKS_CHAT_ENDPOINT_{i}") for i in range(1, 4)),
+            e.get("DATABRICKS_MODEL") or None,
             integer("BENCHMARK_SEED", 7, 0),
             integer("PARSEBENCH_MAX_ROWS", 1000),
             integer("GOVDOCS_MAX_DOCUMENTS", 100),
@@ -112,9 +113,9 @@ class BenchmarkConfig:
             raise RuntimeError("DATABASE_URL is required for Neon operations")
         return self.database_url
 
-    def require_gateway(self) -> tuple[str, str, tuple[str, str, str]]:
-        if not self.gateway_base_url or not self.gateway_token or not all(self.chat_endpoints):
+    def require_gateway(self) -> tuple[str, str, str]:
+        if not self.gateway_base_url or not self.gateway_token or not self.gateway_model:
             raise RuntimeError(
-                "DATABRICKS_BASE_URL, DATABRICKS_TOKEN, and all three chat endpoints are required"
+                "DATABRICKS_BASE_URL, DATABRICKS_TOKEN, and DATABRICKS_MODEL are required"
             )
-        return self.gateway_base_url, self.gateway_token, self.chat_endpoints  # type: ignore
+        return self.gateway_base_url, self.gateway_token, self.gateway_model

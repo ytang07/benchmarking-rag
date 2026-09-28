@@ -39,13 +39,6 @@ def _persist(path: str, records: list[dict]) -> None:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
 
 
-def _endpoint_specs(config: BenchmarkConfig):
-    return tuple(
-        (f"DATABRICKS_CHAT_ENDPOINT_{i}", endpoint)
-        for i, endpoint in enumerate(config.chat_endpoints, 1)
-    )
-
-
 def _skip_records(
     data: PreparedData, model_key: str, config: BenchmarkConfig, reason: str, run_id: str
 ) -> list[dict]:
@@ -55,8 +48,8 @@ def _skip_records(
             "embedding_model": model_key,
             "run_id": run_id,
             "experiment_id": config.experiment_id,
-            "chat_endpoint_env": env_name,
-            "chat_endpoint": endpoint,
+            "chat_model_env": "DATABRICKS_MODEL",
+            "chat_model": config.gateway_model,
             "status": "skipped",
             "reason": reason,
             "skipped": data.skipped,
@@ -73,7 +66,7 @@ def _skip_records(
                 "total": 0.0,
             },
         }
-        for env_name, endpoint in _endpoint_specs(config)
+        for _ in (config.gateway_model,)
     ]
 
 
@@ -86,7 +79,7 @@ def _run_benchmark(
     run_id: str | None = None,
     _connection=None,
 ) -> list[dict]:
-    """Run one dataset/model and emit one result per configured endpoint."""
+    """Run one dataset/model and emit one result for the configured chat model."""
     if model_key not in MODELS:
         raise ValueError(f"Unknown embedding model {model_key}")
     run_id = run_id or str(uuid4())
@@ -215,70 +208,65 @@ def _run_benchmark(
             + hnsw_seconds
             + exact_seconds
         )
-        for endpoint_env, endpoint in _endpoint_specs(config):
-            record = {
-                "dataset": data.dataset,
-                "embedding_model": model_key,
-                "run_id": run_id,
-                "experiment_id": config.experiment_id,
-                "chat_endpoint_env": endpoint_env,
-                "chat_endpoint": endpoint,
-                "query_id": query["id"],
-                "status": "ok",
-                "retrieval": {
-                    "mode": retrieval_mode,
-                    "hnsw_top_ids": hnsw_ids,
-                    "hnsw_scores": hnsw_scores,
-                    "exact_top_ids": exact_ids,
-                },
-                "timing_seconds": {
-                    "embedding": embedding_seconds + query_embedding_seconds,
-                    "corpus_embedding": embedding_seconds,
-                    "query_embedding": query_embedding_seconds,
-                    "ingest": ingest_seconds,
-                    "hnsw_search": hnsw_seconds,
-                    "exact_scan": exact_seconds,
-                    "total": phase_seconds,
-                },
-                "qrel_threshold": config.qrel_min_score,
-                "native_qrels": data.native_qrels,
-                "evaluation_scope": data.evaluation_scope,
-                "retrieval_metrics": retrieval_metrics,
-                "skipped_count": len(data.skipped),
-                "skipped": data.skipped,
-                "dataset_metadata": data.metadata,
-            }
-            if not config.exact_scan:
-                record["exact_unavailable_reason"] = "EXACT_SCAN=false"
-            if not endpoint or not config.gateway_base_url or not config.gateway_token:
+        record = {
+            "dataset": data.dataset,
+            "embedding_model": model_key,
+            "run_id": run_id,
+            "experiment_id": config.experiment_id,
+            "chat_model_env": "DATABRICKS_MODEL",
+            "chat_model": config.gateway_model,
+            "query_id": query["id"],
+            "status": "ok",
+            "retrieval": {
+                "mode": retrieval_mode,
+                "hnsw_top_ids": hnsw_ids,
+                "hnsw_scores": hnsw_scores,
+                "exact_top_ids": exact_ids,
+            },
+            "timing_seconds": {
+                "embedding": embedding_seconds + query_embedding_seconds,
+                "corpus_embedding": embedding_seconds,
+                "query_embedding": query_embedding_seconds,
+                "ingest": ingest_seconds,
+                "hnsw_search": hnsw_seconds,
+                "exact_scan": exact_seconds,
+                "total": phase_seconds,
+            },
+            "qrel_threshold": config.qrel_min_score,
+            "native_qrels": data.native_qrels,
+            "evaluation_scope": data.evaluation_scope,
+            "retrieval_metrics": retrieval_metrics,
+            "skipped_count": len(data.skipped),
+            "skipped": data.skipped,
+            "dataset_metadata": data.metadata,
+        }
+        if not config.exact_scan:
+            record["exact_unavailable_reason"] = "EXACT_SCAN=false"
+        if not config.gateway_model or not config.gateway_base_url or not config.gateway_token:
+            record["answer_metrics"] = answer_metrics("", "skipped", query.get("reference_answer"))
+            record["answer_metrics"]["reason"] = "gateway model, base URL, or token not configured"
+            record["timing_seconds"]["answer"] = 0.0
+        else:
+            answer_started = perf_counter()
+            try:
+                generated = answer(
+                    query["text"],
+                    context,
+                    config.gateway_model,
+                    config.gateway_base_url,
+                    config.gateway_token,
+                )
                 record["answer_metrics"] = answer_metrics(
-                    "", "skipped", query.get("reference_answer")
+                    generated, "ok", query.get("reference_answer")
                 )
-                record["answer_metrics"]["reason"] = (
-                    "gateway endpoint, base URL, or token not configured"
+            except Exception as exc:
+                record["answer_metrics"] = answer_metrics(
+                    "", "error", query.get("reference_answer")
                 )
-                record["timing_seconds"]["answer"] = 0.0
-            else:
-                answer_started = perf_counter()
-                try:
-                    generated = answer(
-                        query["text"],
-                        context,
-                        endpoint,
-                        config.gateway_base_url,
-                        config.gateway_token,
-                    )
-                    record["answer_metrics"] = answer_metrics(
-                        generated, "ok", query.get("reference_answer")
-                    )
-                except Exception as exc:
-                    record["answer_metrics"] = answer_metrics(
-                        "", "error", query.get("reference_answer")
-                    )
-                    record["answer_metrics"]["reason"] = str(exc)
-                record["timing_seconds"]["answer"] = perf_counter() - answer_started
-            record["timing_seconds"]["total"] = phase_seconds + record["timing_seconds"]["answer"]
-            records.append(record)
+                record["answer_metrics"]["reason"] = str(exc)
+            record["timing_seconds"]["answer"] = perf_counter() - answer_started
+        record["timing_seconds"]["total"] = phase_seconds + record["timing_seconds"]["answer"]
+        records.append(record)
     if persist:
         _persist(config.results_path, records)
     return records
@@ -315,7 +303,7 @@ def run_matrix(
     dataset_names: tuple[str, ...] | None = None,
     model_keys: tuple[str, ...] | None = None,
 ) -> list[dict]:
-    """Execute all 27 dataset/model/endpoint combinations."""
+    """Execute all dataset/embedding-model/chat-model combinations."""
     if persist is None:
         persist = config.persist_results
     if not smoke:
