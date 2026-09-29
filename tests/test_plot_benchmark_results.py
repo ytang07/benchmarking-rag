@@ -31,12 +31,12 @@ def test_stream_aggregate_extracts_metrics_and_preserves_unavailable_values():
     ]
     groups, stats = plot.stream_aggregate([json.dumps(row) if isinstance(row, dict) else row for row in rows])
     assert stats == {"lines": 4, "records": 3, "malformed": 1, "malformed_records": 0}
-    group = groups[("minilm", "chat", "vidore", "bounded", "unknown", "bounded", "unknown")]
+    group = groups[("minilm", "chat", "vidore", "unknown", "bounded", "unknown", "bounded", "unknown")]
     assert group.count == 1 and group.metrics["retrieval_bounded_sample_hnsw"]["count"] == 1
     assert group.metrics["retrieval_bounded_sample_hnsw"]["sum"] == 0.5
     assert group.metrics["retrieval_native_hnsw"]["count"] == 0
     assert group.metrics["answer_correctness"]["min"] == 0.8
-    skipped = groups[("minilm", "unknown", "unknown", "skipped", "unknown", "unknown", "unknown")]
+    skipped = groups[("minilm", "unknown", "unknown", "unknown", "skipped", "unknown", "unknown", "unknown")]
     assert skipped.skipped == 1
 
 
@@ -58,6 +58,24 @@ def test_unexpected_metric_containers_are_unavailable_and_non_fatal():
     accumulator = next(iter(groups.values()))
     assert accumulator.skipped == 2
     assert accumulator.metrics["answer_correctness"]["count"] == 0
+
+
+def test_malformed_lines_extreme_numbers_and_grouping_fields_are_safe():
+    huge = 10**4000
+    groups, stats = plot.stream_aggregate([
+        "not json",
+        json.dumps({
+            "embedding_model": {"nested": "data"}, "chat_model": ["large"],
+            "dataset": "d" * 1000, "evaluation_scope": 7,
+            "retrieval": {"mode": {"nested": "data"}},
+            "timing_seconds": {"total": huge},
+        }),
+    ])
+    assert stats["malformed"] == 1 and stats["records"] == 1
+    key = next(iter(groups))
+    assert key == ("unknown", "unknown", "d" * 128 + "...", "unknown", "unknown", "unknown", "unknown", "unknown")
+    accumulator = groups[key]
+    assert accumulator.metrics["latency_total"]["count"] == 0
 
 
 def test_cli_writes_expected_outputs_for_explicit_paths(tmp_path):

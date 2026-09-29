@@ -18,16 +18,32 @@ METRIC_FIELDS = (
     "latency_embedding", "latency_ingest", "latency_search", "latency_exact_scan", "latency_answer",
 )
 GROUP_FIELDS = (
-    "embedding_model", "chat_model", "dataset", "evaluation_scope", "evaluation_scope_detail",
+    "embedding_model", "chat_model", "dataset", "retrieval_mode", "evaluation_scope", "evaluation_scope_detail",
     "provenance_scope", "provenance_scope_detail",
 )
+MAX_CATEGORY_LENGTH = 128
 
 
 def _number(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    value = float(value)
+    try:
+        value = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
     return value if math.isfinite(value) else None
+
+
+def _category(value: Any) -> str:
+    """Return a bounded grouping label without stringifying nested values."""
+    if not isinstance(value, str):
+        return "unknown"
+    value = value.strip()
+    if not value:
+        return "unknown"
+    if len(value) > MAX_CATEGORY_LENGTH:
+        return value[:MAX_CATEGORY_LENGTH] + "..."
+    return value
 
 
 def _value(record: dict[str, Any], *path: str) -> Any:
@@ -46,17 +62,20 @@ def extract_scalars(record: dict[str, Any]) -> dict[str, Any]:
     retrieval = containers["retrieval_metrics"] if isinstance(containers["retrieval_metrics"], dict) else {}
     answer = containers["answer_metrics"] if isinstance(containers["answer_metrics"], dict) else {}
     timing = containers["timing_seconds"] if isinstance(containers["timing_seconds"], dict) else {}
+    status = _category(record.get("status"))
+    evaluation_scope = _category(record.get("evaluation_scope"))
     return {
-        "embedding_model": record.get("embedding_model") or "unknown",
-        "chat_model": record.get("chat_model") or record.get("chat_model_env") or "unknown",
-        "dataset": record.get("dataset") or "unknown",
-        "evaluation_scope": record.get("evaluation_scope") or "unknown",
-        "evaluation_scope_detail": record.get("evaluation_scope_detail") or "unknown",
-        "provenance_scope": record.get("provenance_scope") or "unknown",
-        "provenance_scope_detail": record.get("provenance_scope_detail") or "unknown",
+        "embedding_model": _category(record.get("embedding_model")),
+        "chat_model": _category(record.get("chat_model") or record.get("chat_model_env")),
+        "dataset": _category(record.get("dataset")),
+        "retrieval_mode": _category(_value(record, "retrieval", "mode")),
+        "evaluation_scope": evaluation_scope,
+        "evaluation_scope_detail": _category(record.get("evaluation_scope_detail")),
+        "provenance_scope": _category(record.get("provenance_scope")),
+        "provenance_scope_detail": _category(record.get("provenance_scope_detail")),
         "malformed": malformed,
-        "skipped": malformed or str(record.get("status", "")).lower() in {"skipped", "error"}
-        or record.get("evaluation_scope") == "skipped",
+        "skipped": malformed or status.lower() in {"skipped", "error"}
+        or evaluation_scope == "skipped",
         "answer_correctness": _number(_value(answer, "correctness", "value")),
         "answer_relevance": _number(_value(answer, "answer_relevance", "value")),
         "judge_score": _number(_value(record, "judge", "value")),
