@@ -26,6 +26,7 @@ class PreparedData:
     evaluation_scope: str = "incomplete"
     metadata: dict = field(default_factory=dict)
     native_provenance: dict = field(default_factory=dict)
+    provenance_scope: str = "not_available"
 
 
 def validate_record(dataset: str, record: dict) -> str:
@@ -313,6 +314,9 @@ def prepare_records(
             "corpus": [json_safe(row) for row in corpus_rows],
             "queries": [json_safe(row) for row in query_rows],
         }
+        result.provenance_scope = (
+            "bounded_sample" if corpus_truncated or query_truncated else "complete"
+        )
         for row in corpus_rows[:max_rows]:
             doc_id = str(_get(row, "corpus_id", "id", "doc_id"))
             text = _get(row, "markdown", "text", "content")

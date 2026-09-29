@@ -171,7 +171,6 @@ def answer_metrics(
         "available": bool(claim_count),
         "method": "factual_claims_with_at_least_one_valid_citation",
     }
-    result["citation_completeness"] = result["claim_level_citation_completeness"]
     grounded_values = [item["grounded"] for item in claim_results if item["grounded_available"]]
     result["groundedness"] = {
         "value": (sum(grounded_values) / claim_count)

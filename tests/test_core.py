@@ -259,6 +259,9 @@ def test_vidore_bounded_sample_renames_metrics_and_preserves_retained_qrels():
     data = prepare_records("vidore", raw, max_rows=1)
     assert data.metadata["evaluation_scope"] == "bounded_sample"
     assert data.evaluation_scope == "bounded_sample" and data.native_qrels is True
+    assert data.provenance_scope == "bounded_sample"
+    assert len(data.native_provenance["corpus"]) == 1
+    assert len(data.native_provenance["queries"]) == 1
     assert data.qrels == {"q1": {"d1": 1.0}}
     result = pipeline.run_benchmark(
         BenchmarkConfig.from_env({}), data, "minilm", smoke=True, persist=False
@@ -266,6 +269,15 @@ def test_vidore_bounded_sample_renames_metrics_and_preserves_retained_qrels():
     metrics = result[0]["retrieval_metrics"]
     assert "bounded_sample_hnsw_recall@k" in metrics
     assert "native_hnsw_recall@k" not in metrics
+    assert result[0]["provenance_scope"] == "bounded_sample"
+
+
+def test_native_answer_fallback_normalizes_empty_raw_answers():
+    assert pipeline._native_answers({"raw_answers": [], "answer": "native"}) == "native"
+    assert pipeline._native_answers({"raw_answers": [""], "answer": "native"}) == "native"
+    assert pipeline._native_answers({"raw_answers": ["", "preferred"], "answer": "native"}) == [
+        "preferred"
+    ]
 
 
 def test_exact_scan_false_does_not_report_unmeasured_exact_metrics():

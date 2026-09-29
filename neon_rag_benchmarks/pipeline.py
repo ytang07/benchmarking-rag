@@ -34,12 +34,18 @@ def _document_id(chunk_id: str) -> str:
 def _native_answers(query: dict):
     """Prefer non-empty raw answers, falling back to the native answer field."""
     raw_answers = query.get("raw_answers")
-    if raw_answers:
+    if isinstance(raw_answers, (list, tuple)):
+        normalized_raw = [answer for answer in raw_answers if str(answer).strip()]
+        if normalized_raw:
+            return normalized_raw
+    elif raw_answers is not None and str(raw_answers).strip():
         return raw_answers
     answer_value = query.get("answer")
-    if answer_value:
+    if answer_value is not None and str(answer_value).strip():
         return answer_value
     answers = query.get("answers")
+    if isinstance(answers, (list, tuple)):
+        answers = [answer for answer in answers if str(answer).strip()]
     return answers if answers else None
 
 
@@ -66,6 +72,8 @@ def _skip_records(
             "reason": reason,
             "skipped": data.skipped,
             "evaluation_scope": data.evaluation_scope,
+            "provenance_scope": data.provenance_scope,
+            "vidore_provenance": json_safe(data.native_provenance),
             "native_qrels": data.native_qrels,
             "timing_seconds": {
                 "embedding": 0.0,
@@ -287,6 +295,7 @@ def _run_benchmark(
             "skipped_count": len(data.skipped),
             "skipped": data.skipped,
             "dataset_metadata": data.metadata,
+            "provenance_scope": data.provenance_scope,
         }
         if not config.exact_scan:
             record["exact_unavailable_reason"] = "EXACT_SCAN=false"
@@ -402,6 +411,7 @@ def run_matrix(
                 qrels={"smoke-query": {"smoke-1": 1.0}},
                 native_qrels=False,
                 evaluation_scope="synthetic",
+                provenance_scope="synthetic",
             )
         else:
             raw = load_optional(
