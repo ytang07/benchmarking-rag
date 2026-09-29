@@ -133,10 +133,7 @@ def insert_chunks(
     with connection.cursor() as cur:
         cur.executemany(
             f"INSERT INTO {table} (run_id, dataset, doc_id, content, embedding) VALUES (%s, %s, %s, %s, %s)",
-            [
-                (run_id, dataset, doc_id, text, vector)
-                for (doc_id, text), vector in zip(chunks, vectors)
-            ],
+            [(run_id, dataset, item[0], item[1], vector) for item, vector in zip(chunks, vectors)],
         )
     connection.commit()
 

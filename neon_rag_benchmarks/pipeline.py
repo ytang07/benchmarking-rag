@@ -7,10 +7,10 @@ from uuid import uuid4
 
 from . import db
 from .config import BenchmarkConfig, MODELS
-from .datasets import PreparedData, load_optional, prepare_records, smoke_documents
-from .embeddings import embed_query, embed_texts
+from .datasets import PreparedData, json_safe, load_optional, prepare_records, smoke_documents
+from .embeddings import embed_query, embed_texts, warm_model
 from .gateway import answer
-from .metrics import answer_metrics, exact_cosine_search, mrr_at_k, recall_at_k
+from .metrics import answer_metrics, exact_cosine_search, mrr_at_k, parse_citations, recall_at_k
 from .schema import validate_vectors
 
 
@@ -31,6 +31,28 @@ def _document_id(chunk_id: str) -> str:
     return chunk_id.split("#chunk-", 1)[0]
 
 
+def _native_answers(query: dict):
+    """Prefer non-empty raw answers, falling back to the native answer field."""
+
+    def normalized(value):
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        if isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
+            values = [item.strip() for item in value if item.strip()]
+            return values or None
+        return None
+
+    raw_answers = query.get("raw_answers")
+    normalized_raw = normalized(raw_answers)
+    if normalized_raw is not None:
+        return normalized_raw
+    answer_value = normalized(query.get("answer"))
+    if answer_value is not None:
+        return answer_value
+    return normalized(query.get("answers"))
+
+
 def _persist(path: str, records: list[dict]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -39,8 +61,36 @@ def _persist(path: str, records: list[dict]) -> None:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
 
 
+def _record_scopes(data: PreparedData) -> tuple[str, str, str, str]:
+    """Prevent late-added skipped rows from being emitted as complete scopes."""
+    evaluation_scope = data.evaluation_scope
+    evaluation_detail = data.evaluation_scope_detail
+    provenance_scope = data.provenance_scope
+    provenance_detail = data.provenance_scope_detail
+    if data.skipped:
+        if evaluation_scope == "complete":
+            evaluation_scope, evaluation_detail = "bounded", "filtered_rows"
+        if provenance_scope == "complete":
+            provenance_scope, provenance_detail = "bounded", "filtered_rows"
+    if evaluation_scope == "complete" and evaluation_detail != "full_dataset":
+        evaluation_scope = "bounded" if evaluation_detail != "skipped" else "skipped"
+    if evaluation_scope == "bounded" and evaluation_detail == "full_dataset":
+        evaluation_detail = "inconsistent_scope"
+    if provenance_scope == "complete" and provenance_detail != "full_dataset":
+        provenance_scope = "bounded" if provenance_detail != "skipped" else "skipped"
+    if provenance_scope == "bounded" and provenance_detail == "full_dataset":
+        provenance_detail = "inconsistent_scope"
+    return evaluation_scope, evaluation_detail, provenance_scope, provenance_detail
+
+
 def _skip_records(
-    data: PreparedData, model_key: str, config: BenchmarkConfig, reason: str, run_id: str
+    data: PreparedData,
+    model_key: str,
+    config: BenchmarkConfig,
+    reason: str,
+    run_id: str,
+    dataset_initialization_seconds: float = 0.0,
+    model_initialization_seconds: float = 0.0,
 ) -> list[dict]:
     return [
         {
@@ -53,8 +103,18 @@ def _skip_records(
             "status": "skipped",
             "reason": reason,
             "skipped": data.skipped,
-            "evaluation_scope": data.evaluation_scope,
+            "evaluation_scope": "skipped",
+            "evaluation_scope_detail": "skipped_record",
+            "provenance_scope": "skipped",
+            "provenance_scope_detail": "skipped_record",
+            "vidore_provenance": json_safe(data.native_provenance),
             "native_qrels": data.native_qrels,
+            "qrels": {},
+            "retrieval_metrics": None,
+            "retrieved_passages": [],
+            "answer": None,
+            "citations": [],
+            "answer_metrics": answer_metrics("", "skipped"),
             "timing_seconds": {
                 "embedding": 0.0,
                 "corpus_embedding": 0.0,
@@ -63,6 +123,10 @@ def _skip_records(
                 "hnsw_search": 0.0,
                 "exact_scan": 0.0,
                 "answer": 0.0,
+                "initialization": model_initialization_seconds,
+                "model_initialization_seconds": model_initialization_seconds,
+                "dataset_initialization_seconds": dataset_initialization_seconds,
+                "rag_evaluation": 0.0,
                 "total": 0.0,
             },
         }
@@ -78,26 +142,44 @@ def _run_benchmark(
     persist: bool = True,
     run_id: str | None = None,
     _connection=None,
+    dataset_initialization_seconds: float = 0.0,
 ) -> list[dict]:
     """Run one dataset/model and emit one result for the configured chat model."""
+    if data.dataset != "vidore":
+        raise ValueError(
+            f"Vidore-only benchmark execution does not support dataset={data.dataset!r}"
+        )
     if model_key not in MODELS:
         raise ValueError(f"Unknown embedding model {model_key}")
     run_id = run_id or str(uuid4())
     if not data.documents:
-        records = _skip_records(data, model_key, config, "no documents after validation", run_id)
+        records = _skip_records(
+            data,
+            model_key,
+            config,
+            "no documents after validation",
+            run_id,
+            dataset_initialization_seconds,
+        )
         if persist:
             _persist(config.results_path, records)
         return records
+    initialization_started = perf_counter()
+    if smoke:
+        initialization_seconds = 0.0
+    else:
+        warm_model(model_key)
+        initialization_seconds = perf_counter() - initialization_started
     chunks = [
-        (doc["id"] + f"#chunk-{i}", chunk)
+        (doc["id"] + f"#chunk-{i}", chunk, doc)
         for doc in data.documents
         for i, chunk in enumerate(chunk_text(doc["text"], config.chunk_size, config.chunk_overlap))
     ]
     embedding_started = perf_counter()
     vectors = (
-        [_synthetic_vector(text) for _, text in chunks]
+        [_synthetic_vector(text) for _, text, _ in chunks]
         if smoke
-        else embed_texts([text for _, text in chunks], model_key)
+        else embed_texts([text for _, text, _ in chunks], model_key)
     )
     embedding_seconds = perf_counter() - embedding_started
     expected_dimension = 8 if smoke else MODELS[model_key][1]
@@ -127,11 +209,14 @@ def _run_benchmark(
             config,
             "no queries supplied; provide QUERY_SOURCE for this dataset",
             run_id,
+            dataset_initialization_seconds,
+            initialization_seconds,
         )
         if persist:
             _persist(config.results_path, records)
         return records
     records = []
+    evaluation_scope, evaluation_detail, provenance_scope, provenance_detail = _record_scopes(data)
     for query in queries:
         query_embedding_started = perf_counter()
         query_vector = (
@@ -140,7 +225,7 @@ def _run_benchmark(
         query_embedding_seconds = perf_counter() - query_embedding_started
         if smoke:
             ranked = exact_cosine_search(
-                query_vector, list(zip([doc_id for doc_id, _ in chunks], vectors)), config.top_k
+                query_vector, list(zip([doc_id for doc_id, _, _ in chunks], vectors)), config.top_k
             )
             hnsw_ids = [item[0] for item in ranked]
             hnsw_scores = [item[1] for item in ranked]
@@ -184,11 +269,13 @@ def _run_benchmark(
         hnsw_eval_ids = [_document_id(doc_id) for doc_id in hnsw_ids]
         exact_eval_ids = [_document_id(doc_id) for doc_id in exact_ids]
         retrieval_metrics = None
-        if relevant:
+        if relevant and evaluation_scope != "skipped":
             metric_prefix = (
                 "native"
-                if data.native_qrels and data.evaluation_scope == "full_dataset"
-                else ("synthetic" if data.evaluation_scope == "synthetic" else "bounded_sample")
+                if data.native_qrels
+                and evaluation_scope == "complete"
+                and evaluation_detail == "full_dataset"
+                else "bounded_sample"
             )
             retrieval_metrics = {
                 f"{metric_prefix}_hnsw_recall@k": recall_at_k(
@@ -200,7 +287,31 @@ def _run_benchmark(
                 retrieval_metrics[f"{metric_prefix}_exact_recall@k"] = recall_at_k(
                     exact_eval_ids, relevant, config.top_k
                 )
-        context = "\n\n".join(text for doc_id, text in chunks if doc_id in hnsw_ids)
+        passages = []
+        for doc_id, text, document in chunks:
+            if doc_id not in hnsw_ids:
+                continue
+            page = document.get("page_number", document.get("page"))
+            citation_id = f"{doc_id}|page={page}" if page is not None else doc_id
+            passages.append(
+                {
+                    "citation_id": citation_id,
+                    "chunk_id": doc_id,
+                    "document_id": document.get("id"),
+                    "doc_id": document.get("doc_id"),
+                    "corpus_id": document.get("corpus_id"),
+                    "page": page,
+                    "bbox": document.get("bbox", document.get("bounding_box")),
+                    "evidence": document.get("evidence"),
+                    "metadata": document.get("metadata"),
+                    "native_provenance": document.get("native_provenance"),
+                    "text": text,
+                }
+            )
+        passages = [json_safe(passage) for passage in passages]
+        context = "\n\n".join(
+            f"[{passage['citation_id']}] {passage['text']}" for passage in passages
+        )
         phase_seconds = (
             embedding_seconds
             + query_embedding_seconds
@@ -217,12 +328,23 @@ def _run_benchmark(
             "chat_model": config.gateway_model,
             "query_id": query["id"],
             "status": "ok",
+            "native_answer": json_safe(
+                {
+                    "answer": query.get("answer"),
+                    "raw_answers": query.get("raw_answers", query.get("answers")),
+                    "evidence": query.get("evidence"),
+                    "native_provenance": query.get("native_provenance"),
+                }
+            ),
+            "vidore_provenance": json_safe(data.native_provenance),
             "retrieval": {
                 "mode": retrieval_mode,
                 "hnsw_top_ids": hnsw_ids,
                 "hnsw_scores": hnsw_scores,
                 "exact_top_ids": exact_ids,
+                "retrieved_passages": passages,
             },
+            "retrieved_passages": passages,
             "timing_seconds": {
                 "embedding": embedding_seconds + query_embedding_seconds,
                 "corpus_embedding": embedding_seconds,
@@ -231,19 +353,37 @@ def _run_benchmark(
                 "hnsw_search": hnsw_seconds,
                 "exact_scan": exact_seconds,
                 "total": phase_seconds,
+                "rag_evaluation": query_embedding_seconds + hnsw_seconds + exact_seconds,
+                "initialization": initialization_seconds,
+                "model_initialization_seconds": initialization_seconds,
+                "dataset_initialization_seconds": dataset_initialization_seconds,
             },
             "qrel_threshold": config.qrel_min_score,
             "native_qrels": data.native_qrels,
-            "evaluation_scope": data.evaluation_scope,
+            "qrels": data.qrels.get(query["id"], {}),
+            "evaluation_scope": evaluation_scope,
             "retrieval_metrics": retrieval_metrics,
             "skipped_count": len(data.skipped),
             "skipped": data.skipped,
             "dataset_metadata": data.metadata,
+            "provenance_scope": provenance_scope,
+            "evaluation_scope_detail": evaluation_detail,
+            "provenance_scope_detail": provenance_detail,
         }
         if not config.exact_scan:
             record["exact_unavailable_reason"] = "EXACT_SCAN=false"
         if not config.gateway_model or not config.gateway_base_url or not config.gateway_token:
-            record["answer_metrics"] = answer_metrics("", "skipped", query.get("reference_answer"))
+            record["answer"] = None
+            record["citations"] = []
+            record["answer_metrics"] = answer_metrics(
+                "",
+                "skipped",
+                query.get("reference_answer"),
+                _native_answers(query),
+                query["text"],
+                [],
+                passages,
+            )
             record["answer_metrics"]["reason"] = "gateway model, base URL, or token not configured"
             record["timing_seconds"]["answer"] = 0.0
         else:
@@ -256,16 +396,38 @@ def _run_benchmark(
                     config.gateway_base_url,
                     config.gateway_token,
                 )
+                record["answer"] = generated
+                record["citations"] = parse_citations(generated)
                 record["answer_metrics"] = answer_metrics(
-                    generated, "ok", query.get("reference_answer")
+                    generated,
+                    "ok",
+                    query.get("reference_answer"),
+                    _native_answers(query),
+                    query["text"],
+                    record["citations"],
+                    passages,
                 )
             except Exception as exc:
+                record["answer"] = None
+                record["citations"] = []
                 record["answer_metrics"] = answer_metrics(
-                    "", "error", query.get("reference_answer")
+                    "",
+                    "error",
+                    query.get("reference_answer"),
+                    _native_answers(query),
+                    query["text"],
+                    [],
+                    passages,
                 )
                 record["answer_metrics"]["reason"] = str(exc)
             record["timing_seconds"]["answer"] = perf_counter() - answer_started
         record["timing_seconds"]["total"] = phase_seconds + record["timing_seconds"]["answer"]
+        record["timing_seconds"]["rag_evaluation"] = (
+            query_embedding_seconds
+            + hnsw_seconds
+            + exact_seconds
+            + record["timing_seconds"]["answer"]
+        )
         records.append(record)
     if persist:
         _persist(config.results_path, records)
@@ -279,14 +441,32 @@ def run_benchmark(
     smoke: bool = False,
     persist: bool = True,
     run_id: str | None = None,
+    dataset_initialization_seconds: float = 0.0,
 ) -> list[dict]:
     """Run a benchmark and always rollback/close a live connection on every path."""
     if smoke or not data.documents:
-        return _run_benchmark(config, data, model_key, smoke, persist, run_id)
+        return _run_benchmark(
+            config,
+            data,
+            model_key,
+            smoke,
+            persist,
+            run_id,
+            dataset_initialization_seconds=dataset_initialization_seconds,
+        )
     connection = None
     try:
         connection = db.connect(config.require_database())
-        return _run_benchmark(config, data, model_key, smoke, persist, run_id, connection)
+        return _run_benchmark(
+            config,
+            data,
+            model_key,
+            smoke,
+            persist,
+            run_id,
+            connection,
+            dataset_initialization_seconds,
+        )
     except Exception:
         if connection is not None:
             connection.rollback()
@@ -306,14 +486,21 @@ def run_matrix(
     """Execute all dataset/embedding-model/chat-model combinations."""
     if persist is None:
         persist = config.persist_results
+    selected_datasets = dataset_names or ("vidore",)
+    unsupported = [name for name in selected_datasets if name != "vidore"]
+    if unsupported:
+        raise ValueError(
+            "Vidore-only workflow accepts dataset_names containing only 'vidore'; "
+            f"unsupported dataset(s): {unsupported}"
+        )
     if not smoke:
         config.require_gateway()
     # EXPERIMENT_ID is a human label; every invocation gets a fresh immutable run id.
     run_id = str(uuid4())
     output = []
-    selected_datasets = dataset_names or ("vidore", "parsebench", "govdocs")
     selected_models = model_keys or tuple(MODELS)
     for dataset_name in selected_datasets:
+        dataset_initialization_started = perf_counter()
         if smoke:
             data = PreparedData(
                 dataset_name,
@@ -321,7 +508,10 @@ def run_matrix(
                 queries=[{"id": "smoke-query", "text": "How does vector retrieval work?"}],
                 qrels={"smoke-query": {"smoke-1": 1.0}},
                 native_qrels=False,
-                evaluation_scope="synthetic",
+                evaluation_scope="bounded",
+                evaluation_scope_detail="synthetic",
+                provenance_scope="skipped",
+                provenance_scope_detail="synthetic",
             )
         else:
             raw = load_optional(
@@ -345,8 +535,17 @@ def run_matrix(
                 config.govdocs_max_document_bytes,
                 config.govdocs_max_text_bytes,
             )
+        dataset_initialization_seconds = perf_counter() - dataset_initialization_started
         for model_key in selected_models:
             output.extend(
-                run_benchmark(config, data, model_key, smoke=smoke, persist=persist, run_id=run_id)
+                run_benchmark(
+                    config,
+                    data,
+                    model_key,
+                    smoke=smoke,
+                    persist=persist,
+                    run_id=run_id,
+                    dataset_initialization_seconds=dataset_initialization_seconds,
+                )
             )
     return output
