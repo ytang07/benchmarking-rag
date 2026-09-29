@@ -307,6 +307,7 @@ def test_vidore_native_answers_and_evidence_are_retained():
                     "page_number": 4,
                     "bbox": [1, 2, 3, 4],
                     "metadata": {"native": b"bytes"},
+                    "arbitrary_native_field": {"nested": [1, b"raw"]},
                 }
             ],
             "queries": [
@@ -316,6 +317,7 @@ def test_vidore_native_answers_and_evidence_are_retained():
                     "answer": "Evidence",
                     "raw_answers": ["Evidence"],
                     "evidence": [{"page": 4}],
+                    "arbitrary_query_field": {"native": True},
                 }
             ],
             "qrels": [{"query_id": "q-1", "corpus_id": "doc-1", "score": 1}],
@@ -325,6 +327,13 @@ def test_vidore_native_answers_and_evidence_are_retained():
     assert data.documents[0]["page_number"] == 4
     assert data.documents[0]["bbox"] == [1, 2, 3, 4]
     assert data.documents[0]["metadata"] == {"native": "b'bytes'"}
+    assert data.documents[0]["native_provenance"]["arbitrary_native_field"] == {
+        "nested": [1, "b'raw'"]
+    }
+    assert data.native_provenance["corpus"][0]["arbitrary_native_field"] == {
+        "nested": [1, "b'raw'"]
+    }
+    assert data.native_provenance["queries"][0]["arbitrary_query_field"] == {"native": True}
 
 
 def test_citation_validation_and_honest_answer_metric_availability():
@@ -339,6 +348,7 @@ def test_citation_validation_and_honest_answer_metric_availability():
     assert metrics["correctness"]["available"] is False
     assert metrics["answer_relevance"]["value"] is None
     assert metrics["groundedness"]["available"] is True
+    assert metrics["groundedness"]["label"] == "lexical_heuristic_not_semantic_entailment"
 
 
 def test_claim_citations_do_not_pool_unrelated_passages_or_allow_uncited_claims():
@@ -364,10 +374,21 @@ def test_vidore_result_persists_answer_provenance_and_timing(tmp_path):
     data = pipeline.PreparedData(
         "vidore",
         documents=[{"id": "doc-1", "text": "Evidence", "page": 4}],
-        queries=[{"id": "q-1", "text": "What?", "raw_answers": ["Evidence"]}],
+        queries=[
+            {
+                "id": "q-1",
+                "text": "What?",
+                "raw_answers": [],
+                "answer": "Evidence",
+            }
+        ],
         qrels={"q-1": {"doc-1": 1.0}},
         native_qrels=True,
         evaluation_scope="full_dataset",
+        native_provenance={
+            "corpus": [{"id": "doc-1", "arbitrary": {"value": "kept"}}],
+            "queries": [{"id": "q-1", "arbitrary": [1, 2, 3]}],
+        },
     )
     config = BenchmarkConfig.from_env({"RESULTS_PATH": str(tmp_path / "results.jsonl")})
     result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=True)[0]
@@ -376,6 +397,9 @@ def test_vidore_result_persists_answer_provenance_and_timing(tmp_path):
     assert result["retrieved_passages"][0]["document_id"] == "doc-1"
     assert result["retrieved_passages"][0]["text"] == "Evidence"
     assert result["answer_metrics"]["correctness"]["available"] is True
+    assert result["vidore_provenance"]["corpus"]
+    persisted = (tmp_path / "results.jsonl").read_text()
+    assert '"arbitrary": {"value": "kept"}' in persisted
     assert result["timing_seconds"]["rag_evaluation"] >= 0
     assert '"retrieved_passages"' in (tmp_path / "results.jsonl").read_text()
 

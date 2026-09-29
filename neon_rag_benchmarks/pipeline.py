@@ -31,6 +31,18 @@ def _document_id(chunk_id: str) -> str:
     return chunk_id.split("#chunk-", 1)[0]
 
 
+def _native_answers(query: dict):
+    """Prefer non-empty raw answers, falling back to the native answer field."""
+    raw_answers = query.get("raw_answers")
+    if raw_answers:
+        return raw_answers
+    answer_value = query.get("answer")
+    if answer_value:
+        return answer_value
+    answers = query.get("answers")
+    return answers if answers else None
+
+
 def _persist(path: str, records: list[dict]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -217,6 +229,7 @@ def _run_benchmark(
                     "bbox": document.get("bbox", document.get("bounding_box")),
                     "evidence": document.get("evidence"),
                     "metadata": document.get("metadata"),
+                    "native_provenance": document.get("native_provenance"),
                     "text": text,
                 }
             )
@@ -245,8 +258,10 @@ def _run_benchmark(
                     "answer": query.get("answer"),
                     "raw_answers": query.get("raw_answers", query.get("answers")),
                     "evidence": query.get("evidence"),
+                    "native_provenance": query.get("native_provenance"),
                 }
             ),
+            "vidore_provenance": json_safe(data.native_provenance),
             "retrieval": {
                 "mode": retrieval_mode,
                 "hnsw_top_ids": hnsw_ids,
@@ -282,7 +297,7 @@ def _run_benchmark(
                 "",
                 "skipped",
                 query.get("reference_answer"),
-                query.get("raw_answers", query.get("answers", query.get("answer"))),
+                _native_answers(query),
                 query["text"],
                 [],
                 passages,
@@ -305,7 +320,7 @@ def _run_benchmark(
                     generated,
                     "ok",
                     query.get("reference_answer"),
-                    query.get("raw_answers", query.get("answers", query.get("answer"))),
+                    _native_answers(query),
                     query["text"],
                     record["citations"],
                     passages,
@@ -317,7 +332,7 @@ def _run_benchmark(
                     "",
                     "error",
                     query.get("reference_answer"),
-                    query.get("raw_answers", query.get("answers", query.get("answer"))),
+                    _native_answers(query),
                     query["text"],
                     [],
                     passages,

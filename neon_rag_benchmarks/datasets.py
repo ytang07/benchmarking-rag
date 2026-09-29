@@ -25,6 +25,7 @@ class PreparedData:
     native_qrels: bool = False
     evaluation_scope: str = "incomplete"
     metadata: dict = field(default_factory=dict)
+    native_provenance: dict = field(default_factory=dict)
 
 
 def validate_record(dataset: str, record: dict) -> str:
@@ -308,6 +309,10 @@ def prepare_records(
         query_truncated = len(query_rows) > max_rows
         corpus_rows = corpus_rows[:max_rows]
         query_rows = query_rows[:max_rows]
+        result.native_provenance = {
+            "corpus": [json_safe(row) for row in corpus_rows],
+            "queries": [json_safe(row) for row in query_rows],
+        }
         for row in corpus_rows[:max_rows]:
             doc_id = str(_get(row, "corpus_id", "id", "doc_id"))
             text = _get(row, "markdown", "text", "content")
@@ -319,6 +324,7 @@ def prepare_records(
                             "doc_id": _get(row, "doc_id"),
                             "corpus_id": _get(row, "corpus_id"),
                             "text": str(text),
+                            "native_provenance": json_safe(row),
                             **_vidore_metadata(row),
                         }
                     )
@@ -330,7 +336,7 @@ def prepare_records(
             query_id = str(_get(row, "query_id", "id"))
             text = _get(row, "query", "text")
             if text:
-                query = {"id": query_id, "text": str(text)}
+                query = {"id": query_id, "text": str(text), "native_provenance": json_safe(row)}
                 for key in ("answer", "raw_answers", "answers", "evidence", "page", "page_number"):
                     value = _get(row, key)
                     if value is not None:

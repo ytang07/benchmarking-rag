@@ -178,7 +178,9 @@ def answer_metrics(
         if claim_count and len(grounded_values) == claim_count
         else None,
         "available": bool(claim_count and len(grounded_values) == claim_count),
-        "method": "claim_token_overlap_with_only_that_claims_cited_text",
+        "label": "lexical_heuristic_not_semantic_entailment",
+        "method": "lexical_heuristic_claim_token_overlap_with_only_that_claims_cited_text",
+        "semantic_entailment": False,
         "reason": None
         if claim_count and len(grounded_values) == claim_count
         else "one or more claims lack a valid parseable citation",
