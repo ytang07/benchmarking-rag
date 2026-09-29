@@ -4,8 +4,21 @@ import pytest
 from neon_rag_benchmarks.config import BenchmarkConfig, MODELS
 from neon_rag_benchmarks import db
 from neon_rag_benchmarks import pipeline
-from neon_rag_benchmarks.datasets import _extract_pdf, prepare_records, validate_record
-from neon_rag_benchmarks.metrics import answer_metrics, exact_cosine_search, mrr_at_k, recall_at_k
+from neon_rag_benchmarks.datasets import (
+    _extract_pdf,
+    load_optional,
+    prepare_records,
+    validate_record,
+)
+from neon_rag_benchmarks.metrics import (
+    answer_metrics,
+    exact_cosine_search,
+    mrr_at_k,
+    parse_claims,
+    parse_citations,
+    recall_at_k,
+    validate_citations,
+)
 from neon_rag_benchmarks.pipeline import chunk_text, run_matrix
 from neon_rag_benchmarks.schema import create_schema_sql, validate_dimension, validate_vectors
 from neon_rag_benchmarks.smoke import run_smoke
@@ -42,18 +55,33 @@ def test_offline_smoke():
     assert result["offline"] is True and result["recall@1"] == 1.0
 
 
-def test_offline_matrix_executes_all_dataset_model_paths(tmp_path):
+def test_offline_matrix_executes_vidore_first_paths(tmp_path):
     config = BenchmarkConfig.from_env({"RESULTS_PATH": str(tmp_path / "results.jsonl")})
     results = run_matrix(config, smoke=True, persist=True)
-    assert len(results) == 9
+    assert len(results) == 3
     assert all(row["status"] == "ok" for row in results)
-    assert results[0]["retrieval_metrics"]["synthetic_hnsw_recall@k"] == 1.0
-    assert results[0]["evaluation_scope"] == "synthetic"
+    assert results[0]["retrieval_metrics"]["bounded_sample_hnsw_recall@k"] == 1.0
+    assert not any(key.startswith("synthetic_") for key in results[0]["retrieval_metrics"])
+    assert results[0]["evaluation_scope"] == "bounded"
+    assert results[0]["evaluation_scope_detail"] == "synthetic"
+    assert results[0]["provenance_scope"] == "skipped"
+    assert results[0]["provenance_scope_detail"] == "synthetic"
+    assert results[0]["timing_seconds"]["dataset_initialization_seconds"] >= 0
+    assert results[0]["timing_seconds"]["model_initialization_seconds"] == 0.0
+    assert results[0]["timing_seconds"]["rag_evaluation"] >= 0
     assert results[0]["native_qrels"] is False
-    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 9
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 3
     assert len({row["run_id"] for row in results}) == 1
     assert {row["chat_model_env"] for row in results} == {"DATABRICKS_MODEL"}
     assert {row["chat_model"] for row in results} == {None}
+
+
+def test_public_workflow_rejects_non_vidore_datasets():
+    config = BenchmarkConfig.from_env({})
+    with pytest.raises(ValueError, match="Vidore-only workflow"):
+        run_matrix(config, smoke=True, persist=False, dataset_names=("parsebench",))
+    with pytest.raises(ValueError, match="Vidore-only smoke"):
+        run_smoke("govdocs")
 
 
 def test_chunking_is_bounded():
@@ -65,62 +93,30 @@ def test_vector_and_answer_validation(tmp_path):
         validate_vectors([[1.0]], 2)
     result = answer_metrics("A correct answer!", "ok", "a correct answer")
     assert result["normalized_exact_match"] is True
-    source = tmp_path / "queries.jsonl"
-    source.write_text('{"query_id":"q1","text":"What?","relevant_doc_ids":"d1,d2"}\n')
-    data = prepare_records(
-        "parsebench", [{"id": "d1", "text_content": "text"}], query_source=str(source)
-    )
-    assert data.queries[0]["id"] == "q1" and set(data.qrels["q1"]) == {"d1", "d2"}
-    object_source = tmp_path / "queries.json"
-    object_source.write_text(
-        '{"queries":[{"query_id":"q2","text":"Why?"}],"qrels":{"q2":{"d3":2}}}'
-    )
-    object_data = prepare_records(
-        "parsebench", [{"id": "d3", "text_content": "text"}], query_source=str(object_source)
-    )
-    assert object_data.qrels == {"q2": {"d3": 2.0}}
+    assert result["correctness"]["scope"] == "legacy_fallback_not_vidore_native"
+    assert result["normalized_exact_match_scope"] == "legacy_fallback_not_vidore_native"
+    unavailable = answer_metrics("A response", "ok")
+    assert unavailable["normalized_exact_match"] is None
+    assert unavailable["normalized_exact_match_method"] == "unavailable"
+    assert unavailable["normalized_exact_match_scope"] == "not_evaluated"
+    assert unavailable["normalized_exact_match_reason"]
+    with pytest.raises(ValueError, match="Vidore-only record preparation"):
+        prepare_records("parsebench", [])
+    with pytest.raises(ValueError, match="Vidore-only dataset loading"):
+        load_optional("govdocs")
     with pytest.raises(ValueError, match="raw PDF exceeds"):
         _extract_pdf({"bytes": b"too large"}, max_bytes=2)
-    assert validate_record("govdocs", {"id": "x", "broken_pdf": "false"}) == "x"
+    with pytest.raises(ValueError, match="Vidore-only record validation"):
+        validate_record("govdocs", {"id": "x", "broken_pdf": "false"})
     with pytest.raises(ValueError):
         validate_record("govdocs", {"id": "x", "broken_pdf": "unknown"})
 
 
-def test_govdocs_cumulative_raw_budget_and_nested_pdf_shape():
-    from pypdf import PdfWriter
-    import io
-
-    writer = PdfWriter()
-    writer.add_blank_page(width=72, height=72)
-    buffer = io.BytesIO()
-    writer.write(buffer)
-    valid_pdf = buffer.getvalue()
-    data = prepare_records(
-        "govdocs",
-        [
-            {"id": "a", "broken_pdf": "false", "pdf": {"data": valid_pdf}},
-            {"id": "b", "broken_pdf": 0, "pdf": {"bytes": valid_pdf}},
-        ],
-        max_documents=10,
-        max_bytes=len(valid_pdf) + 1,
-        pdf_max_document_bytes=len(valid_pdf) + 1,
-    )
-    assert data.metadata["raw_pdf_bytes_consumed"] == len(valid_pdf)
-    assert data.metadata["raw_pdf_budget_exhausted"] is True
-    assert any("cumulative raw PDF byte budget" in item["reason"] for item in data.skipped)
-
-
-def test_malformed_pdf_is_a_stable_document_skip():
-    data = prepare_records(
-        "govdocs",
-        [{"id": "bad", "broken_pdf": False, "pdf": {"bytes": b"not pdf"}}],
-        max_bytes=100,
-        pdf_max_document_bytes=100,
-    )
-    assert any(
-        item["id"] == "bad" and item["reason"].startswith("malformed PDF bytes")
-        for item in data.skipped
-    )
+def test_non_vidore_public_dataset_boundaries_reject_before_adapters():
+    with pytest.raises(ValueError, match="Vidore-only record preparation"):
+        prepare_records("govdocs", [])
+    with pytest.raises(ValueError, match="Vidore-only dataset loading"):
+        load_optional("parsebench")
 
 
 def test_run_id_is_fresh_even_with_reused_experiment_label():
@@ -147,12 +143,19 @@ def test_connection_is_rolled_back_and_closed_on_pipeline_failure(monkeypatch):
     monkeypatch.setattr(db, "connect", lambda _: connection)
     monkeypatch.setattr(db, "table_exists", lambda *args: False)
     monkeypatch.setattr(db, "setup", lambda *args: (_ for _ in ()).throw(RuntimeError("boom")))
-    monkeypatch.setattr(pipeline, "embed_texts", lambda texts, model: [[0.0] * 384 for _ in texts])
+    events = []
+    monkeypatch.setattr(pipeline, "warm_model", lambda model: events.append("initialize"))
+    monkeypatch.setattr(
+        pipeline,
+        "embed_texts",
+        lambda texts, model: (events.append("corpus_embedding") or [[0.0] * 384 for _ in texts]),
+    )
     config = BenchmarkConfig.from_env({"DATABASE_URL": "postgres://redacted"})
-    data = pipeline.PreparedData("parsebench", documents=[{"id": "d", "text": "text"}], queries=[])
+    data = pipeline.PreparedData("vidore", documents=[{"id": "d", "text": "text"}], queries=[])
     with pytest.raises(RuntimeError, match="boom"):
         pipeline.run_benchmark(config, data, "minilm", persist=False)
     assert connection.rolled_back and connection.closed
+    assert events == ["initialize", "corpus_embedding"]
 
 
 def test_db_cleanup_is_scoped_to_run_id():
@@ -248,8 +251,12 @@ def test_vidore_bounded_sample_renames_metrics_and_preserves_retained_qrels():
         ],
     }
     data = prepare_records("vidore", raw, max_rows=1)
-    assert data.metadata["evaluation_scope"] == "bounded_sample"
-    assert data.evaluation_scope == "bounded_sample" and data.native_qrels is True
+    assert data.metadata["evaluation_scope_detail"] == "bounded_sample"
+    assert data.evaluation_scope == "bounded" and data.native_qrels is True
+    assert data.evaluation_scope_detail == "bounded_sample"
+    assert data.provenance_scope == "bounded"
+    assert len(data.native_provenance["corpus"]) == 1
+    assert len(data.native_provenance["queries"]) == 1
     assert data.qrels == {"q1": {"d1": 1.0}}
     result = pipeline.run_benchmark(
         BenchmarkConfig.from_env({}), data, "minilm", smoke=True, persist=False
@@ -257,16 +264,114 @@ def test_vidore_bounded_sample_renames_metrics_and_preserves_retained_qrels():
     metrics = result[0]["retrieval_metrics"]
     assert "bounded_sample_hnsw_recall@k" in metrics
     assert "native_hnsw_recall@k" not in metrics
+    assert result[0]["provenance_scope"] == "bounded"
+    assert "evaluation_scope" not in result[0]["dataset_metadata"]
+    assert "provenance_scope" not in result[0]["dataset_metadata"]
+
+
+def test_non_truncated_filtered_vidore_rows_downgrade_provenance_scope():
+    data = prepare_records(
+        "vidore",
+        {
+            "corpus": [{"id": "d1", "markdown": "kept"}, {"id": "d2", "markdown": ""}],
+            "queries": [{"id": "q1", "query": "kept"}, {"id": "q2", "query": ""}],
+            "qrels": [{"query_id": "q1", "corpus_id": "d1", "score": 1}],
+        },
+        max_rows=2,
+    )
+    assert data.metadata["corpus_truncated"] is False
+    assert data.metadata["query_truncated"] is False
+    assert data.provenance_scope == "bounded"
+    assert data.provenance_scope_detail == "filtered_rows"
+    assert len(data.native_provenance["corpus"]) == 2
+    assert len(data.native_provenance["queries"]) == 2
+    result = pipeline.run_benchmark(
+        BenchmarkConfig.from_env({}), data, "minilm", smoke=True, persist=False
+    )[0]
+    assert "evaluation_scope" not in result["dataset_metadata"]
+    assert "provenance_scope" not in result["dataset_metadata"]
+
+
+def test_retrieval_prefix_uses_effective_scopes_after_late_or_inconsistent_changes():
+    config = BenchmarkConfig.from_env({})
+    late_skipped = pipeline.PreparedData(
+        "vidore",
+        documents=[{"id": "d1", "text": "kept"}],
+        queries=[{"id": "q1", "text": "kept"}],
+        qrels={"q1": {"d1": 1.0}},
+        native_qrels=True,
+        evaluation_scope="complete",
+        evaluation_scope_detail="full_dataset",
+        provenance_scope="complete",
+        provenance_scope_detail="full_dataset",
+    )
+    late_skipped.skipped.append({"id": "late", "reason": "filtered"})
+    late_result = pipeline.run_benchmark(config, late_skipped, "minilm", smoke=True, persist=False)[
+        0
+    ]
+    assert late_result["evaluation_scope"] == "bounded"
+    assert late_result["retrieval_metrics"] is not None
+    assert "native_hnsw_recall@k" not in late_result["retrieval_metrics"]
+
+    inconsistent = pipeline.PreparedData(
+        "vidore",
+        documents=[{"id": "d1", "text": "kept"}],
+        queries=[{"id": "q1", "text": "kept"}],
+        qrels={"q1": {"d1": 1.0}},
+        native_qrels=True,
+        evaluation_scope="complete",
+        evaluation_scope_detail="bounded_sample",
+        provenance_scope="complete",
+        provenance_scope_detail="bounded_sample",
+    )
+    inconsistent_result = pipeline.run_benchmark(
+        config, inconsistent, "minilm", smoke=True, persist=False
+    )[0]
+    assert inconsistent_result["evaluation_scope"] == "bounded"
+    assert "native_hnsw_recall@k" not in inconsistent_result["retrieval_metrics"]
+
+
+def test_native_answer_fallback_normalizes_empty_raw_answers():
+    assert pipeline._native_answers({"raw_answers": [], "answer": "native"}) == "native"
+    assert pipeline._native_answers({"raw_answers": [""], "answer": "native"}) == "native"
+    assert pipeline._native_answers({"raw_answers": ["", "preferred"], "answer": "native"}) == [
+        "preferred"
+    ]
+    assert (
+        pipeline._native_answers({"raw_answers": {"bad": "shape"}, "answer": "native"}) == "native"
+    )
+    assert pipeline._native_answers({"raw_answers": ["", 3], "answer": "native"}) == "native"
+
+
+def test_skipped_result_has_evaluation_schema(tmp_path):
+    data = pipeline.PreparedData(
+        "vidore",
+        evaluation_scope="complete",
+        evaluation_scope_detail="full_dataset",
+        provenance_scope="complete",
+        provenance_scope_detail="full_dataset",
+    )
+    config = BenchmarkConfig.from_env({"RESULTS_PATH": str(tmp_path / "results.jsonl")})
+    result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=True)[0]
+    assert result["status"] == "skipped"
+    assert result["evaluation_scope"] == "skipped"
+    assert result["provenance_scope"] == "skipped"
+    assert result["provenance_scope_detail"] == "skipped_record"
+    assert result["answer"] is None
+    assert result["citations"] == []
+    assert result["retrieved_passages"] == []
+    assert result["qrels"] == {}
 
 
 def test_exact_scan_false_does_not_report_unmeasured_exact_metrics():
     config = BenchmarkConfig.from_env({"EXACT_SCAN": "false"})
     data = pipeline.PreparedData(
-        "parsebench",
+        "vidore",
         documents=[{"id": "d", "text": "text"}],
         queries=[{"id": "q", "text": "text"}],
         qrels={"q": {"d": 1.0}},
-        evaluation_scope="bounded_sample",
+        evaluation_scope="bounded",
+        evaluation_scope_detail="bounded_sample",
     )
     result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=False)[0]
     assert "exact_recall@k" not in result["retrieval_metrics"]
@@ -285,3 +390,183 @@ def test_notebook_offline_execution():
     document = nbformat.read(notebook, as_version=4)
     nbformat.validate(document)
     nbclient.NotebookClient(document, timeout=60, kernel_name="python3").execute()
+
+
+def test_vidore_native_answers_and_evidence_are_retained():
+    data = prepare_records(
+        "vidore",
+        {
+            "corpus": [
+                {
+                    "corpus_id": "doc-1",
+                    "markdown": "Evidence",
+                    "page_number": 4,
+                    "bbox": [1, 2, 3, 4],
+                    "metadata": {"native": b"bytes"},
+                    "arbitrary_native_field": {"nested": [1, b"raw"]},
+                }
+            ],
+            "queries": [
+                {
+                    "query_id": "q-1",
+                    "query": "What?",
+                    "answer": "Evidence",
+                    "raw_answers": ["Evidence"],
+                    "evidence": [{"page": 4}],
+                    "arbitrary_query_field": {"native": True},
+                }
+            ],
+            "qrels": [{"query_id": "q-1", "corpus_id": "doc-1", "score": 1}],
+        },
+    )
+    assert data.queries[0]["raw_answers"] == ["Evidence"]
+    assert data.documents[0]["page_number"] == 4
+    assert data.documents[0]["bbox"] == [1, 2, 3, 4]
+    assert data.provenance_scope == "complete"
+    assert data.evaluation_scope == "complete"
+    assert data.documents[0]["metadata"] == {"native": "b'bytes'"}
+    assert data.documents[0]["native_provenance"]["arbitrary_native_field"] == {
+        "nested": [1, "b'raw'"]
+    }
+    assert data.native_provenance["corpus"][0]["arbitrary_native_field"] == {
+        "nested": [1, "b'raw'"]
+    }
+    assert data.native_provenance["queries"][0]["arbitrary_query_field"] == {"native": True}
+
+
+def test_citation_validation_and_honest_answer_metric_availability():
+    passages = [{"citation_id": "doc#chunk-0|page=4", "text": "Evidence"}]
+    citations = parse_citations("Evidence [doc#chunk-0|page=4] [missing]")
+    checked = validate_citations(citations, passages)
+    assert checked["valid"] == ["doc#chunk-0|page=4"]
+    assert checked["invalid"] == ["missing"]
+    metrics = answer_metrics(
+        "Evidence [doc#chunk-0|page=4]", "ok", citations=citations[:1], passages=passages
+    )
+    assert metrics["correctness"]["available"] is False
+    assert metrics["answer_relevance"]["value"] is None
+    assert metrics["groundedness"]["available"] is True
+    assert metrics["groundedness"]["label"] == "lexical_heuristic_not_semantic_entailment"
+
+
+def test_claim_citations_do_not_pool_unrelated_passages_or_allow_uncited_claims():
+    passages = [
+        {"citation_id": "doc-a#chunk-0", "text": "Alpha is a color."},
+        {"citation_id": "doc-b#chunk-0", "text": "Beta is a fruit."},
+    ]
+    claims = parse_claims("Alpha is a color [doc-a#chunk-0]. Beta is a fruit.")
+    assert claims[0]["citations"] == ["doc-a#chunk-0"]
+    assert claims[1]["citations"] == []
+    metrics = answer_metrics(
+        "Alpha is a color [doc-a#chunk-0]. Beta is a fruit.",
+        "ok",
+        citations=["doc-a#chunk-0"],
+        passages=passages,
+    )
+    assert metrics["claim_level_citation_completeness"]["value"] == 0.5
+    assert metrics["groundedness"]["available"] is False
+    assert metrics["claims"][1]["grounded"] is None
+
+
+def test_vidore_result_persists_answer_provenance_and_timing(tmp_path):
+    data = pipeline.PreparedData(
+        "vidore",
+        documents=[{"id": "doc-1", "text": "Evidence", "page": 4}],
+        queries=[
+            {
+                "id": "q-1",
+                "text": "What?",
+                "raw_answers": [],
+                "answer": "Evidence",
+            }
+        ],
+        qrels={"q-1": {"doc-1": 1.0}},
+        native_qrels=True,
+        evaluation_scope="complete",
+        evaluation_scope_detail="full_dataset",
+        native_provenance={
+            "corpus": [{"id": "doc-1", "arbitrary": {"value": "kept"}}],
+            "queries": [{"id": "q-1", "arbitrary": [1, 2, 3]}],
+        },
+    )
+    config = BenchmarkConfig.from_env({"RESULTS_PATH": str(tmp_path / "results.jsonl")})
+    result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=True)[0]
+    assert result["answer"] is None
+    assert result["retrieved_passages"][0]["page"] == 4
+    assert result["retrieved_passages"][0]["document_id"] == "doc-1"
+    assert result["retrieved_passages"][0]["text"] == "Evidence"
+    assert result["answer_metrics"]["correctness"]["available"] is False
+    assert result["answer_metrics"]["correctness"]["value"] is None
+    assert result["answer_metrics"]["answer_relevance"]["value"] is None
+    assert result["answer_metrics"]["groundedness"]["value"] is None
+    assert result["timing_seconds"]["initialization"] == 0.0
+    assert result["vidore_provenance"]["corpus"]
+    persisted = (tmp_path / "results.jsonl").read_text()
+    assert '"arbitrary": {"value": "kept"}' in persisted
+    assert result["timing_seconds"]["rag_evaluation"] >= 0
+    assert "evaluation_scope" not in result["dataset_metadata"]
+    assert "provenance_scope" not in result["dataset_metadata"]
+    assert '"retrieved_passages"' in (tmp_path / "results.jsonl").read_text()
+
+
+def test_gateway_error_and_blank_answer_do_not_score_reference_answers(monkeypatch):
+    data = pipeline.PreparedData(
+        "vidore",
+        documents=[{"id": "doc-1", "text": "Evidence"}],
+        queries=[{"id": "q-1", "text": "What?", "answer": "Expected"}],
+        qrels={"q-1": {"doc-1": 1.0}},
+    )
+    config = BenchmarkConfig.from_env(
+        {
+            "DATABRICKS_BASE_URL": "https://gateway",
+            "DATABRICKS_TOKEN": "token",
+            "DATABRICKS_MODEL": "model",
+        }
+    )
+    monkeypatch.setattr(
+        pipeline, "answer", lambda *args: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    error_result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=False)[0]
+    monkeypatch.setattr(pipeline, "answer", lambda *args: "")
+    blank_result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=False)[0]
+    for result in (error_result, blank_result):
+        metrics = result["answer_metrics"]
+        assert metrics["correctness"]["value"] is None
+        assert metrics["answer_relevance"]["value"] is None
+        assert metrics["retrieval_passage_citation_completeness"]["value"] is None
+        assert metrics["claim_level_citation_completeness"]["value"] is None
+        assert metrics["groundedness"]["value"] is None
+
+
+def test_prepared_scope_downgrades_complete_when_skipped_rows_are_present():
+    data = pipeline.PreparedData(
+        "vidore",
+        skipped=[{"id": "bad", "reason": "filtered"}],
+        evaluation_scope="complete",
+        provenance_scope="complete",
+    )
+    assert data.evaluation_scope == "bounded"
+    assert data.provenance_scope == "bounded"
+
+
+def test_prepared_metadata_drops_contradictory_canonical_scope_keys():
+    data = pipeline.PreparedData(
+        "vidore",
+        metadata={"evaluation_scope": "complete", "provenance_scope": "complete"},
+    )
+    assert "evaluation_scope" not in data.metadata
+    assert "provenance_scope" not in data.metadata
+    assert data.metadata["evaluation_scope_detail"] == "complete"
+    assert data.metadata["provenance_scope_detail"] == "complete"
+
+
+def test_notebook_is_vidore_three_model_workflow():
+    import json
+
+    notebook = json.loads(
+        (Path(__file__).parents[1] / "notebooks" / "benchmark_matrix.ipynb").read_text()
+    )
+    source = "\n".join("\n".join(cell["source"]) for cell in notebook["cells"])
+    assert "9 dataset/embedding-model" not in source
+    assert "selected_count = len(dataset_names) * len(model_keys or tuple(MODELS))" in source
+    assert "Answer relevance is unavailable without a judge" in source

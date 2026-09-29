@@ -15,6 +15,15 @@ def _model(model_key: str):
     return SentenceTransformer(name, trust_remote_code=model_key == "nomic")
 
 
+def warm_model(model_key: str) -> None:
+    """Initialize and cache an embedding model outside per-request timing."""
+    from .config import MODELS
+
+    if model_key not in MODELS:
+        raise ValueError(f"Unknown embedding model: {model_key}")
+    _model(model_key)
+
+
 def embed_texts(texts: list[str], model_key: str, batch_size: int = 32) -> list[list[float]]:
     from .config import MODELS
 

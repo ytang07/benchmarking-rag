@@ -10,9 +10,19 @@ from pathlib import Path
 
 DATASET_INFO = {
     "vidore": "vidore/vidore_v3_industrial: corpus/test markdown, queries/test query, qrels/test query_id/corpus_id/score; native qrels.",
-    "parsebench": "llamaindex/ParseBench parse-bench: text_content split/expected_markdown; no native qrels, supply/generated queries.",
-    "govdocs": "BEE-spoke-data/govdocs1-pdf-source index/sample: metadata and PDFs, no extracted text; filter broken_pdf=false and supply/generated queries.",
 }
+
+
+def _canonical_scope(value: str, provenance: bool = False) -> str:
+    if value in {"complete", "bounded", "skipped"}:
+        return value
+    if value in {"full_dataset"}:
+        return "complete"
+    if value in {"bounded_sample"}:
+        return "bounded"
+    if value == "synthetic":
+        return "skipped" if provenance else "bounded"
+    return "skipped"
 
 
 @dataclass
@@ -23,19 +33,41 @@ class PreparedData:
     qrels: dict[str, dict[str, float]] = field(default_factory=dict)
     skipped: list[dict[str, str]] = field(default_factory=list)
     native_qrels: bool = False
-    evaluation_scope: str = "incomplete"
+    evaluation_scope: str = "skipped"
+    evaluation_scope_detail: str = "incomplete"
     metadata: dict = field(default_factory=dict)
+    native_provenance: dict = field(default_factory=dict)
+    provenance_scope: str = "skipped"
+    provenance_scope_detail: str = "not_available"
+
+    def __post_init__(self):
+        for scope_key in ("evaluation_scope", "provenance_scope"):
+            if scope_key in self.metadata:
+                detail_key = f"{scope_key}_detail"
+                self.metadata.setdefault(detail_key, self.metadata[scope_key])
+                self.metadata.pop(scope_key)
+        if self.evaluation_scope not in {"complete", "bounded", "skipped"}:
+            if self.evaluation_scope_detail == "incomplete":
+                self.evaluation_scope_detail = self.evaluation_scope
+            self.evaluation_scope = _canonical_scope(self.evaluation_scope)
+        if self.provenance_scope not in {"complete", "bounded", "skipped"}:
+            if self.provenance_scope_detail == "not_available":
+                self.provenance_scope_detail = self.provenance_scope
+            self.provenance_scope = _canonical_scope(self.provenance_scope, provenance=True)
+        if self.skipped:
+            if self.evaluation_scope == "complete":
+                self.evaluation_scope = "bounded"
+                self.evaluation_scope_detail = "filtered_rows"
+            if self.provenance_scope == "complete":
+                self.provenance_scope = "bounded"
+                self.provenance_scope_detail = "filtered_rows"
 
 
 def validate_record(dataset: str, record: dict) -> str:
-    if dataset not in DATASET_INFO:
-        raise ValueError(f"Unknown dataset {dataset}; choose {tuple(DATASET_INFO)}")
-    if dataset == "vidore" and not record.get("text", record.get("markdown")):
+    if dataset != "vidore":
+        raise ValueError(f"Vidore-only record validation does not support dataset={dataset!r}")
+    if not record.get("text", record.get("markdown")):
         raise ValueError("Vidore record needs markdown text")
-    if dataset == "parsebench" and not record.get("text_content"):
-        raise ValueError("ParseBench record needs text_content")
-    if dataset == "govdocs" and _is_broken(record.get("broken_pdf")):
-        raise ValueError("GovDocs broken_pdf must be an explicit false value")
     return str(record.get("id", record.get("doc_id", "")))
 
 
@@ -54,6 +86,8 @@ def load_optional(
     govdocs_split: str = "train",
 ):
     """Load a bounded live sample; credentials/network are required by Hugging Face."""
+    if name != "vidore":
+        raise ValueError(f"Vidore-only dataset loading does not support dataset={name!r}")
     try:
         from datasets import load_dataset
     except ImportError as exc:
@@ -243,6 +277,24 @@ def _get(row, *names):
     return None
 
 
+def _vidore_metadata(row: dict) -> dict:
+    """Keep native page, box, and evidence fields available for answer provenance."""
+    metadata = {}
+    for key in ("page", "page_number", "bbox", "bounding_box", "evidence", "metadata"):
+        value = _get(row, key)
+        if value is not None:
+            metadata[key] = value
+    return metadata
+
+
+def json_safe(value):
+    """Convert native dataset objects (including bytes/features) into JSON-safe values."""
+    try:
+        return json.loads(json.dumps(value, default=lambda item: repr(item), allow_nan=False))
+    except (TypeError, ValueError):
+        return repr(value)
+
+
 def _reservoir_sample(rows, limit: int, seed: int):
     """Bound memory for streaming non-Vidore rows while retaining deterministic sampling."""
     rng = random.Random(seed)
@@ -272,8 +324,8 @@ def prepare_records(
     pdf_max_text_bytes: int = 1_000_000,
 ) -> PreparedData:
     """Normalize a bounded HF result and record honest skips instead of inventing text/queries."""
-    if name not in DATASET_INFO:
-        raise ValueError(f"Unknown dataset {name}; choose {tuple(DATASET_INFO)}")
+    if name != "vidore":
+        raise ValueError(f"Vidore-only record preparation does not support dataset={name!r}")
     result = PreparedData(name)
     if name == "vidore":
         if not isinstance(raw, dict) or not all(
@@ -290,11 +342,26 @@ def prepare_records(
         query_truncated = len(query_rows) > max_rows
         corpus_rows = corpus_rows[:max_rows]
         query_rows = query_rows[:max_rows]
+        result.native_provenance = {
+            "corpus": [json_safe(row) for row in corpus_rows],
+            "queries": [json_safe(row) for row in query_rows],
+        }
         for row in corpus_rows[:max_rows]:
             doc_id = str(_get(row, "corpus_id", "id", "doc_id"))
             text = _get(row, "markdown", "text", "content")
             if text:
-                result.documents.append({"id": doc_id, "text": str(text)})
+                result.documents.append(
+                    json_safe(
+                        {
+                            "id": doc_id,
+                            "doc_id": _get(row, "doc_id"),
+                            "corpus_id": _get(row, "corpus_id"),
+                            "text": str(text),
+                            "native_provenance": json_safe(row),
+                            **_vidore_metadata(row),
+                        }
+                    )
+                )
             else:
                 result.skipped.append({"id": doc_id, "reason": "missing markdown/text"})
         retained_query_ids = set()
@@ -302,8 +369,15 @@ def prepare_records(
             query_id = str(_get(row, "query_id", "id"))
             text = _get(row, "query", "text")
             if text:
-                result.queries.append({"id": query_id, "text": str(text)})
+                query = {"id": query_id, "text": str(text), "native_provenance": json_safe(row)}
+                for key in ("answer", "raw_answers", "answers", "evidence", "page", "page_number"):
+                    value = _get(row, key)
+                    if value is not None:
+                        query[key] = json_safe(value)
+                result.queries.append(query)
                 retained_query_ids.add(query_id)
+            else:
+                result.skipped.append({"id": query_id, "reason": "missing query text"})
         qrels_seen = 0
         qrels_retained = 0
         for row in qrel_rows:
@@ -328,7 +402,7 @@ def prepare_records(
                 "query_truncated": query_truncated,
             }
         )
-        result.metadata["evaluation_scope"] = (
+        result.evaluation_scope_detail = (
             "bounded_sample"
             if result.metadata["corpus_truncated"] or result.metadata["query_truncated"]
             else "full_dataset"
@@ -340,8 +414,21 @@ def prepare_records(
             or not qrel_doc_ids.issubset(indexed_ids)
             or result.skipped
         ):
-            result.metadata["evaluation_scope"] = "bounded_sample"
-        result.evaluation_scope = result.metadata["evaluation_scope"]
+            result.evaluation_scope_detail = "bounded_sample"
+        result.evaluation_scope = (
+            "complete" if result.evaluation_scope_detail == "full_dataset" else "bounded"
+        )
+        if corpus_truncated or query_truncated:
+            result.provenance_scope = "bounded"
+            result.provenance_scope_detail = "bounded_sample"
+        elif result.skipped:
+            result.provenance_scope = "bounded"
+            result.provenance_scope_detail = "filtered_rows"
+        else:
+            result.provenance_scope = "complete"
+            result.provenance_scope_detail = "full_dataset"
+        result.metadata["evaluation_scope_detail"] = result.evaluation_scope_detail
+        result.metadata["provenance_scope_detail"] = result.provenance_scope_detail
     else:
         if name == "parsebench":
             rows = _reservoir_sample(_rows(raw) if raw is not None else (), max_rows, seed)
