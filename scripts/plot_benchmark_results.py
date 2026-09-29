@@ -107,6 +107,8 @@ class _Accumulator:
     def add(self, values: dict[str, Any]) -> None:
         self.count += 1
         self.skipped += int(values["skipped"])
+        if values["skipped"]:
+            return
         for field in METRIC_FIELDS:
             value = values[field]
             if value is not None:
@@ -124,6 +126,9 @@ def stream_aggregate(handle: Iterable[str]) -> tuple[dict[tuple[str, ...], _Accu
     for line in handle:
         stats["lines"] += 1
         if not line.strip():
+            continue
+        if any(0xDC80 <= ord(character) <= 0xDCFF for character in line):
+            stats["malformed"] += 1
             continue
         try:
             record = json.loads(line)
@@ -236,7 +241,7 @@ def main() -> int:
     if not args.input.is_file():
         parser.error(f"input JSONL does not exist: {args.input}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    with args.input.open("r", encoding="utf-8") as stream:
+    with args.input.open("r", encoding="utf-8", errors="surrogateescape") as stream:
         groups, stats = stream_aggregate(stream)
     write_summary(args.output_dir, groups, stats)
     _plot(args.output_dir, groups)

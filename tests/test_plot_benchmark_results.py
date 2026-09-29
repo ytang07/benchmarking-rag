@@ -60,6 +60,21 @@ def test_unexpected_metric_containers_are_unavailable_and_non_fatal():
     assert accumulator.metrics["answer_correctness"]["count"] == 0
 
 
+def test_skipped_metrics_do_not_enter_summary_statistics():
+    rows = [
+        json.dumps({"embedding_model": "m", "status": "ok", "timing_seconds": {"total": 2.0},
+                    "answer_metrics": {"correctness": {"value": 0.4}}}),
+        json.dumps({"embedding_model": "m", "status": "skipped", "timing_seconds": {"total": 999.0},
+                    "answer_metrics": {"correctness": {"value": 1.0}}}),
+    ]
+    groups, stats = plot.stream_aggregate(rows)
+    accumulator = next(iter(groups.values()))
+    assert stats["records"] == 2 and accumulator.skipped == 1
+    assert accumulator.metrics["latency_total"] == {"count": 1, "sum": 2.0, "min": 2.0, "max": 2.0}
+    assert accumulator.metrics["answer_correctness"]["count"] == 1
+    assert accumulator.metrics["answer_correctness"]["sum"] == 0.4
+
+
 def test_malformed_lines_extreme_numbers_and_grouping_fields_are_safe():
     huge = 10**4000
     groups, stats = plot.stream_aggregate([
@@ -82,19 +97,20 @@ def test_cli_writes_expected_outputs_for_explicit_paths(tmp_path):
     pytest.importorskip("matplotlib")
     input_path = tmp_path / "input.jsonl"
     output_dir = tmp_path / "nested" / "plots"
-    input_path.write_text(json.dumps({
+    valid_line = json.dumps({
         "embedding_model": "minilm", "evaluation_scope": "bounded",
         "evaluation_scope_detail": "bounded_sample", "provenance_scope": "bounded",
         "provenance_scope_detail": "bounded_sample", "status": "ok",
         "retrieval_metrics": {"bounded_sample_exact_recall@k": 0.75},
         "answer_metrics": {"correctness": {"value": 0.5}},
         "timing_seconds": {"total": 1.0},
-    }) + "\n", encoding="utf-8")
+    }) + "\n"
+    input_path.write_bytes(b"\xff\n" + valid_line.encode())
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--input", str(input_path), "--output-dir", str(output_dir)],
         check=True, capture_output=True, text=True,
     )
-    assert '"records": 1' in result.stdout
+    assert '"records": 1' in result.stdout and '"malformed": 1' in result.stdout
     expected = {
         "benchmark_summary.csv", "benchmark_summary.json", "model_quality_comparison.png",
         "retrieval_quality_comparison.png", "citation_groundedness_comparison.png",
