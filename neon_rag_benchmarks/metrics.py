@@ -100,7 +100,7 @@ def answer_metrics(
         "status": status,
         "answer_chars": len(generated),
         "answer_words": len(generated.split()),
-        "quality_metric_support": "vidore_deterministic_token_f1; no LLM judge",
+        "quality_metric_support": "vidore_deterministic_token_f1_and_optional_llm_judge",
         "normalized_exact_match": None,
         "normalized_exact_match_method": "unavailable",
         "normalized_exact_match_scope": "not_evaluated",
@@ -116,7 +116,12 @@ def answer_metrics(
         result.update(
             {
                 "correctness": {"value": None, "available": False, "reason": reason},
-                "answer_relevance": {"value": None, "available": False, "reason": reason},
+                "answer_relevance": {
+                    "value": None,
+                    "available": False,
+                    "status": "unavailable",
+                    "reason": reason,
+                },
                 "retrieval_passage_citation_completeness": {
                     "value": None,
                     "available": False,
@@ -179,8 +184,9 @@ def answer_metrics(
     result["answer_relevance"] = {
         "value": None,
         "available": False,
-        "method": "judge_not_configured",
-        "reason": "answer relevance requires an optional evaluator/judge",
+        "status": "unavailable",
+        "method": "llm_judge",
+        "reason": "LLM judge did not run",
     }
     citation_result = validate_citations(citations or [], passages or [])
     result["retrieval_passage_citation_completeness"] = {

@@ -11,6 +11,7 @@ MODELS = {
 # Vidore is the only runnable answer-evaluation dataset.
 DATASETS = ("vidore",)
 DEFAULT_CHAT_MODEL = "system.ai.gpt-oss-120b"
+DEFAULT_JUDGE_MODEL = "system.ai.qwen35-122b-a10b"
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,8 @@ class BenchmarkConfig:
     govdocs_max_document_bytes: int = 100_000_000
     govdocs_max_text_bytes: int = 1_000_000
     experiment_id: str | None = None
+    judge_enabled: bool = True
+    judge_model: str = DEFAULT_JUDGE_MODEL
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "BenchmarkConfig":
@@ -79,6 +82,9 @@ class BenchmarkConfig:
         persist_raw = e.get("PERSIST_RESULTS", "true").strip().lower()
         if persist_raw not in {"true", "false", "1", "0", "yes", "no"}:
             raise ValueError("PERSIST_RESULTS must be true/false")
+        judge_raw = e.get("LLM_JUDGE_ENABLED", e.get("JUDGE_ENABLED", "true")).strip().lower()
+        if judge_raw not in {"true", "false", "1", "0", "yes", "no"}:
+            raise ValueError("LLM_JUDGE_ENABLED must be true/false")
         return cls(
             e.get("DATABASE_URL"),
             e.get("DATABRICKS_BASE_URL"),
@@ -107,6 +113,9 @@ class BenchmarkConfig:
             integer("GOVDOCS_MAX_DOCUMENT_BYTES", 100_000_000),
             integer("GOVDOCS_MAX_TEXT_BYTES", 1_000_000),
             e.get("EXPERIMENT_ID") or None,
+            judge_raw in {"true", "1", "yes"},
+            e.get("LLM_JUDGE_MODEL", e.get("DATABRICKS_JUDGE_MODEL", DEFAULT_JUDGE_MODEL))
+            or DEFAULT_JUDGE_MODEL,
         )
 
     def require_database(self) -> str:

@@ -4,6 +4,7 @@ import pytest
 from neon_rag_benchmarks.config import BenchmarkConfig, MODELS
 from neon_rag_benchmarks import db
 from neon_rag_benchmarks import pipeline
+from neon_rag_benchmarks import gateway
 from neon_rag_benchmarks.datasets import (
     _extract_pdf,
     load_optional,
@@ -28,6 +29,9 @@ def test_config_and_model_dimensions():
     c = BenchmarkConfig.from_env({"HNSW_M": "20"})
     assert c.hnsw_m == 20
     assert MODELS["nomic"][1] == 768
+    assert c.judge_enabled is True
+    assert c.judge_model == "system.ai.qwen35-122b-a10b"
+    assert BenchmarkConfig.from_env({"LLM_JUDGE_ENABLED": "false"}).judge_enabled is False
 
 
 def test_schema_is_dimension_safe():
@@ -536,6 +540,83 @@ def test_gateway_error_and_blank_answer_do_not_score_reference_answers(monkeypat
         assert metrics["retrieval_passage_citation_completeness"]["value"] is None
         assert metrics["claim_level_citation_completeness"]["value"] is None
         assert metrics["groundedness"]["value"] is None
+
+
+def test_judge_output_is_structured_and_validated(monkeypatch):
+    class Message:
+        content = '{"score": 0.75, "label": "relevant", "rationale": "Addresses the question."}'
+
+    class Response:
+        choices = [type("Choice", (), {"message": Message()})()]
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    return Response()
+
+    monkeypatch.setitem(__import__("sys").modules, "openai", type("OpenAI", (), {"OpenAI": Client}))
+    assert gateway.judge_answer("Q", "C", "A", "judge", "https://gateway", "token") == {
+        "score": 0.75,
+        "label": "relevant",
+        "rationale": "Addresses the question.",
+    }
+
+
+def test_judge_is_recorded_with_mocked_gateway_and_preserves_deterministic_metrics(monkeypatch):
+    data = pipeline.PreparedData(
+        "vidore",
+        documents=[{"id": "doc-1", "text": "Evidence"}],
+        queries=[{"id": "q-1", "text": "What?", "raw_answers": ["Evidence"]}],
+        qrels={"q-1": {"doc-1": 1.0}},
+    )
+    config = BenchmarkConfig.from_env(
+        {
+            "DATABRICKS_BASE_URL": "https://gateway",
+            "DATABRICKS_TOKEN": "token",
+            "DATABRICKS_MODEL": "answer-model",
+        }
+    )
+    monkeypatch.setattr(pipeline, "answer", lambda *args: "Evidence")
+    monkeypatch.setattr(
+        pipeline,
+        "judge_answer",
+        lambda *args: {"score": 1.0, "label": "relevant", "rationale": "Matches."},
+    )
+    result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=False)[0]
+    assert result["judge"]["status"] == "ok"
+    assert result["judge"]["model"] == "system.ai.qwen35-122b-a10b"
+    assert result["answer_metrics"]["answer_relevance"]["value"] == 1.0
+    assert result["answer_metrics"]["correctness"]["value"] == 1.0
+    assert result["answer_metrics"]["normalized_exact_match"] is True
+
+
+def test_judge_failure_is_explicit_and_does_not_fabricate_score(monkeypatch):
+    data = pipeline.PreparedData(
+        "vidore",
+        documents=[{"id": "doc-1", "text": "Evidence"}],
+        queries=[{"id": "q-1", "text": "What?", "raw_answers": ["Evidence"]}],
+        qrels={"q-1": {"doc-1": 1.0}},
+    )
+    config = BenchmarkConfig.from_env(
+        {
+            "DATABRICKS_BASE_URL": "https://gateway",
+            "DATABRICKS_TOKEN": "token",
+            "DATABRICKS_MODEL": "answer-model",
+        }
+    )
+    monkeypatch.setattr(pipeline, "answer", lambda *args: "Evidence")
+    monkeypatch.setattr(
+        pipeline, "judge_answer", lambda *args: (_ for _ in ()).throw(ValueError("bad JSON"))
+    )
+    result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=False)[0]
+    assert result["judge"]["status"] == "error"
+    assert result["answer_metrics"]["answer_relevance"]["value"] is None
+    assert result["answer_metrics"]["correctness"]["value"] == 1.0
 
 
 def test_prepared_scope_downgrades_complete_when_skipped_rows_are_present():
