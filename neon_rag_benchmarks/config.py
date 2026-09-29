@@ -8,7 +8,8 @@ MODELS = {
     "minilm": ("sentence-transformers/all-MiniLM-L6-v2", 384),
     "mpnet": ("sentence-transformers/all-mpnet-base-v2", 768),
 }
-DATASETS = ("vidore", "parsebench", "govdocs")
+# Vidore is the only runnable answer-evaluation dataset.
+DATASETS = ("vidore",)
 DEFAULT_CHAT_MODEL = "system.ai.gpt-oss-120b"
 
 

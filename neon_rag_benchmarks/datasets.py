@@ -243,6 +243,16 @@ def _get(row, *names):
     return None
 
 
+def _vidore_metadata(row: dict) -> dict:
+    """Keep native page, box, and evidence fields available for answer provenance."""
+    metadata = {}
+    for key in ("page", "page_number", "bbox", "bounding_box", "evidence", "metadata"):
+        value = _get(row, key)
+        if value is not None:
+            metadata[key] = value
+    return metadata
+
+
 def _reservoir_sample(rows, limit: int, seed: int):
     """Bound memory for streaming non-Vidore rows while retaining deterministic sampling."""
     rng = random.Random(seed)
@@ -294,7 +304,7 @@ def prepare_records(
             doc_id = str(_get(row, "corpus_id", "id", "doc_id"))
             text = _get(row, "markdown", "text", "content")
             if text:
-                result.documents.append({"id": doc_id, "text": str(text)})
+                result.documents.append({"id": doc_id, "text": str(text), **_vidore_metadata(row)})
             else:
                 result.skipped.append({"id": doc_id, "reason": "missing markdown/text"})
         retained_query_ids = set()
@@ -302,7 +312,12 @@ def prepare_records(
             query_id = str(_get(row, "query_id", "id"))
             text = _get(row, "query", "text")
             if text:
-                result.queries.append({"id": query_id, "text": str(text)})
+                query = {"id": query_id, "text": str(text)}
+                for key in ("answer", "raw_answers", "answers", "evidence", "page", "page_number"):
+                    value = _get(row, key)
+                    if value is not None:
+                        query[key] = value
+                result.queries.append(query)
                 retained_query_ids.add(query_id)
         qrels_seen = 0
         qrels_retained = 0

@@ -5,7 +5,14 @@ from neon_rag_benchmarks.config import BenchmarkConfig, MODELS
 from neon_rag_benchmarks import db
 from neon_rag_benchmarks import pipeline
 from neon_rag_benchmarks.datasets import _extract_pdf, prepare_records, validate_record
-from neon_rag_benchmarks.metrics import answer_metrics, exact_cosine_search, mrr_at_k, recall_at_k
+from neon_rag_benchmarks.metrics import (
+    answer_metrics,
+    exact_cosine_search,
+    mrr_at_k,
+    parse_citations,
+    recall_at_k,
+    validate_citations,
+)
 from neon_rag_benchmarks.pipeline import chunk_text, run_matrix
 from neon_rag_benchmarks.schema import create_schema_sql, validate_dimension, validate_vectors
 from neon_rag_benchmarks.smoke import run_smoke
@@ -42,15 +49,15 @@ def test_offline_smoke():
     assert result["offline"] is True and result["recall@1"] == 1.0
 
 
-def test_offline_matrix_executes_all_dataset_model_paths(tmp_path):
+def test_offline_matrix_executes_vidore_first_paths(tmp_path):
     config = BenchmarkConfig.from_env({"RESULTS_PATH": str(tmp_path / "results.jsonl")})
     results = run_matrix(config, smoke=True, persist=True)
-    assert len(results) == 9
+    assert len(results) == 3
     assert all(row["status"] == "ok" for row in results)
     assert results[0]["retrieval_metrics"]["synthetic_hnsw_recall@k"] == 1.0
     assert results[0]["evaluation_scope"] == "synthetic"
     assert results[0]["native_qrels"] is False
-    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 9
+    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 3
     assert len({row["run_id"] for row in results}) == 1
     assert {row["chat_model_env"] for row in results} == {"DATABRICKS_MODEL"}
     assert {row["chat_model"] for row in results} == {None}
@@ -285,3 +292,64 @@ def test_notebook_offline_execution():
     document = nbformat.read(notebook, as_version=4)
     nbformat.validate(document)
     nbclient.NotebookClient(document, timeout=60, kernel_name="python3").execute()
+
+
+def test_vidore_native_answers_and_evidence_are_retained():
+    data = prepare_records(
+        "vidore",
+        {
+            "corpus": [
+                {
+                    "corpus_id": "doc-1",
+                    "markdown": "Evidence",
+                    "page_number": 4,
+                    "bbox": [1, 2, 3, 4],
+                }
+            ],
+            "queries": [
+                {
+                    "query_id": "q-1",
+                    "query": "What?",
+                    "answer": "Evidence",
+                    "raw_answers": ["Evidence"],
+                    "evidence": [{"page": 4}],
+                }
+            ],
+            "qrels": [{"query_id": "q-1", "corpus_id": "doc-1", "score": 1}],
+        },
+    )
+    assert data.queries[0]["raw_answers"] == ["Evidence"]
+    assert data.documents[0]["page_number"] == 4
+    assert data.documents[0]["bbox"] == [1, 2, 3, 4]
+
+
+def test_citation_validation_and_honest_answer_metric_availability():
+    passages = [{"citation_id": "doc#chunk-0|page=4", "text": "Evidence"}]
+    citations = parse_citations("Evidence [doc#chunk-0|page=4] [missing]")
+    checked = validate_citations(citations, passages)
+    assert checked["valid"] == ["doc#chunk-0|page=4"]
+    assert checked["invalid"] == ["missing"]
+    metrics = answer_metrics(
+        "Evidence [doc#chunk-0|page=4]", "ok", citations=citations[:1], passages=passages
+    )
+    assert metrics["correctness"]["available"] is False
+    assert metrics["answer_relevance"]["value"] is None
+    assert metrics["groundedness"]["available"] is True
+
+
+def test_vidore_result_persists_answer_provenance_and_timing(tmp_path):
+    data = pipeline.PreparedData(
+        "vidore",
+        documents=[{"id": "doc-1", "text": "Evidence", "page": 4}],
+        queries=[{"id": "q-1", "text": "What?", "raw_answers": ["Evidence"]}],
+        qrels={"q-1": {"doc-1": 1.0}},
+        native_qrels=True,
+        evaluation_scope="full_dataset",
+    )
+    config = BenchmarkConfig.from_env({"RESULTS_PATH": str(tmp_path / "results.jsonl")})
+    result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=True)[0]
+    assert result["answer"] is None
+    assert result["retrieved_passages"][0]["page"] == 4
+    assert result["answer_metrics"]["correctness"]["available"] is True
+    assert result["timing_seconds"]["rag_evaluation"] >= 0
+    assert '"retrieved_passages"' in (tmp_path / "results.jsonl").read_text()

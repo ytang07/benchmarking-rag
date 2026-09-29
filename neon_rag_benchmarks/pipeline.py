@@ -10,7 +10,7 @@ from .config import BenchmarkConfig, MODELS
 from .datasets import PreparedData, load_optional, prepare_records, smoke_documents
 from .embeddings import embed_query, embed_texts
 from .gateway import answer
-from .metrics import answer_metrics, exact_cosine_search, mrr_at_k, recall_at_k
+from .metrics import answer_metrics, exact_cosine_search, mrr_at_k, parse_citations, recall_at_k
 from .schema import validate_vectors
 
 
@@ -89,15 +89,15 @@ def _run_benchmark(
             _persist(config.results_path, records)
         return records
     chunks = [
-        (doc["id"] + f"#chunk-{i}", chunk)
+        (doc["id"] + f"#chunk-{i}", chunk, doc)
         for doc in data.documents
         for i, chunk in enumerate(chunk_text(doc["text"], config.chunk_size, config.chunk_overlap))
     ]
     embedding_started = perf_counter()
     vectors = (
-        [_synthetic_vector(text) for _, text in chunks]
+        [_synthetic_vector(text) for _, text, _ in chunks]
         if smoke
-        else embed_texts([text for _, text in chunks], model_key)
+        else embed_texts([text for _, text, _ in chunks], model_key)
     )
     embedding_seconds = perf_counter() - embedding_started
     expected_dimension = 8 if smoke else MODELS[model_key][1]
@@ -140,7 +140,7 @@ def _run_benchmark(
         query_embedding_seconds = perf_counter() - query_embedding_started
         if smoke:
             ranked = exact_cosine_search(
-                query_vector, list(zip([doc_id for doc_id, _ in chunks], vectors)), config.top_k
+                query_vector, list(zip([doc_id for doc_id, _, _ in chunks], vectors)), config.top_k
             )
             hnsw_ids = [item[0] for item in ranked]
             hnsw_scores = [item[1] for item in ranked]
@@ -200,7 +200,26 @@ def _run_benchmark(
                 retrieval_metrics[f"{metric_prefix}_exact_recall@k"] = recall_at_k(
                     exact_eval_ids, relevant, config.top_k
                 )
-        context = "\n\n".join(text for doc_id, text in chunks if doc_id in hnsw_ids)
+        passages = []
+        for doc_id, text, document in chunks:
+            if doc_id not in hnsw_ids:
+                continue
+            page = document.get("page_number", document.get("page"))
+            citation_id = f"{doc_id}|page={page}" if page is not None else doc_id
+            passages.append(
+                {
+                    "citation_id": citation_id,
+                    "chunk_id": doc_id,
+                    "document_id": document.get("id"),
+                    "page": page,
+                    "bbox": document.get("bbox", document.get("bounding_box")),
+                    "evidence": document.get("evidence"),
+                    "text": text,
+                }
+            )
+        context = "\n\n".join(
+            f"[{passage['citation_id']}] {passage['text']}" for passage in passages
+        )
         phase_seconds = (
             embedding_seconds
             + query_embedding_seconds
@@ -217,12 +236,19 @@ def _run_benchmark(
             "chat_model": config.gateway_model,
             "query_id": query["id"],
             "status": "ok",
+            "native_answer": {
+                "answer": query.get("answer"),
+                "raw_answers": query.get("raw_answers", query.get("answers")),
+                "evidence": query.get("evidence"),
+            },
             "retrieval": {
                 "mode": retrieval_mode,
                 "hnsw_top_ids": hnsw_ids,
                 "hnsw_scores": hnsw_scores,
                 "exact_top_ids": exact_ids,
+                "retrieved_passages": passages,
             },
+            "retrieved_passages": passages,
             "timing_seconds": {
                 "embedding": embedding_seconds + query_embedding_seconds,
                 "corpus_embedding": embedding_seconds,
@@ -231,6 +257,7 @@ def _run_benchmark(
                 "hnsw_search": hnsw_seconds,
                 "exact_scan": exact_seconds,
                 "total": phase_seconds,
+                "rag_evaluation": query_embedding_seconds + hnsw_seconds + exact_seconds,
             },
             "qrel_threshold": config.qrel_min_score,
             "native_qrels": data.native_qrels,
@@ -243,7 +270,17 @@ def _run_benchmark(
         if not config.exact_scan:
             record["exact_unavailable_reason"] = "EXACT_SCAN=false"
         if not config.gateway_model or not config.gateway_base_url or not config.gateway_token:
-            record["answer_metrics"] = answer_metrics("", "skipped", query.get("reference_answer"))
+            record["answer"] = None
+            record["citations"] = []
+            record["answer_metrics"] = answer_metrics(
+                "",
+                "skipped",
+                query.get("reference_answer"),
+                query.get("raw_answers", query.get("answers", query.get("answer"))),
+                query["text"],
+                [],
+                passages,
+            )
             record["answer_metrics"]["reason"] = "gateway model, base URL, or token not configured"
             record["timing_seconds"]["answer"] = 0.0
         else:
@@ -256,16 +293,38 @@ def _run_benchmark(
                     config.gateway_base_url,
                     config.gateway_token,
                 )
+                record["answer"] = generated
+                record["citations"] = parse_citations(generated)
                 record["answer_metrics"] = answer_metrics(
-                    generated, "ok", query.get("reference_answer")
+                    generated,
+                    "ok",
+                    query.get("reference_answer"),
+                    query.get("raw_answers", query.get("answers", query.get("answer"))),
+                    query["text"],
+                    record["citations"],
+                    passages,
                 )
             except Exception as exc:
+                record["answer"] = None
+                record["citations"] = []
                 record["answer_metrics"] = answer_metrics(
-                    "", "error", query.get("reference_answer")
+                    "",
+                    "error",
+                    query.get("reference_answer"),
+                    query.get("raw_answers", query.get("answers", query.get("answer"))),
+                    query["text"],
+                    [],
+                    passages,
                 )
                 record["answer_metrics"]["reason"] = str(exc)
             record["timing_seconds"]["answer"] = perf_counter() - answer_started
         record["timing_seconds"]["total"] = phase_seconds + record["timing_seconds"]["answer"]
+        record["timing_seconds"]["rag_evaluation"] = (
+            query_embedding_seconds
+            + hnsw_seconds
+            + exact_seconds
+            + record["timing_seconds"]["answer"]
+        )
         records.append(record)
     if persist:
         _persist(config.results_path, records)
@@ -311,7 +370,7 @@ def run_matrix(
     # EXPERIMENT_ID is a human label; every invocation gets a fresh immutable run id.
     run_id = str(uuid4())
     output = []
-    selected_datasets = dataset_names or ("vidore", "parsebench", "govdocs")
+    selected_datasets = dataset_names or ("vidore",)
     selected_models = model_keys or tuple(MODELS)
     for dataset_name in selected_datasets:
         if smoke:
