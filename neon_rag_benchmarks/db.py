@@ -4,6 +4,15 @@ from .schema import create_schema_sql, search_sql
 from .schema import validate_vectors
 
 
+def _pgvector_parameter(vector: list[float]):
+    """Wrap a query vector so psycopg sends it as pgvector, not a PostgreSQL array."""
+    try:
+        from pgvector.psycopg import Vector
+    except ImportError as exc:
+        raise RuntimeError("Install pgvector to bind vector search parameters") from exc
+    return Vector(vector)
+
+
 def validate_table_schema(connection, table: str, dimension: int) -> None:
     """Fail closed if a preexisting table is not this benchmark's vector schema."""
     if not table.replace("_", "").isalnum():
@@ -152,9 +161,10 @@ def search(
             raise ValueError("ef_search must be >= 1")
         # SET does not accept bind parameters; this value is validated as an integer first.
         cur.execute(f"SET LOCAL hnsw.ef_search = {int(ef_search)}")
+        query_vector = _pgvector_parameter(vector)
         cur.execute(
             search_sql(table).replace("WHERE dataset = %s", "WHERE run_id = %s AND dataset = %s"),
-            (vector, run_id, dataset, vector, k),
+            (query_vector, run_id, dataset, query_vector, k),
         )
         return cur.fetchall()
 
@@ -162,12 +172,13 @@ def search(
 def exact_search(
     connection, vector: list[float], run_id: str, dataset: str, k: int, table: str = "rag_chunks"
 ):
+    query_vector = _pgvector_parameter(vector)
     with connection.cursor() as cur:
         # Force PostgreSQL's exact scan for a fair baseline instead of allowing HNSW.
         cur.execute("SET LOCAL enable_indexscan = off")
         cur.execute("SET LOCAL enable_bitmapscan = off")
         cur.execute(
             search_sql(table).replace("WHERE dataset = %s", "WHERE run_id = %s AND dataset = %s"),
-            (vector, run_id, dataset, vector, k),
+            (query_vector, run_id, dataset, query_vector, k),
         )
         return cur.fetchall()

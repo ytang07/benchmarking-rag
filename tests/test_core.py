@@ -1,5 +1,7 @@
 import math
 from pathlib import Path
+import sys
+import types
 import pytest
 from neon_rag_benchmarks.config import BenchmarkConfig, MODELS
 from neon_rag_benchmarks import db
@@ -191,6 +193,54 @@ def test_db_cleanup_is_scoped_to_run_id():
     db.clear_dataset(connection, "run-a", "vidore", "rag_chunks_minilm")
     assert connection.cursor_obj.calls[0][1] == ("run-a", "vidore")
     assert connection.commits == 1
+
+
+def test_db_searches_bind_pgvector_parameters_for_hnsw_and_exact_scan(monkeypatch):
+    class FakeVector:
+        def __init__(self, value):
+            self.value = value
+
+    pgvector_psycopg = types.ModuleType("pgvector.psycopg")
+    pgvector_psycopg.Vector = FakeVector
+    pgvector = types.ModuleType("pgvector")
+    pgvector.psycopg = pgvector_psycopg
+    monkeypatch.setitem(sys.modules, "pgvector", pgvector)
+    monkeypatch.setitem(sys.modules, "pgvector.psycopg", pgvector_psycopg)
+
+    class Cursor:
+        def __init__(self):
+            self.calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, sql, params=None):
+            self.calls.append((sql, params))
+
+        def fetchall(self):
+            return []
+
+    class Connection:
+        def __init__(self):
+            self.cursor_obj = Cursor()
+
+        def cursor(self):
+            return self.cursor_obj
+
+    connection = Connection()
+    vector = [1.0, 0.0]
+    db.search(connection, vector, "run-a", "vidore", 3, 40)
+    db.exact_search(connection, vector, "run-a", "vidore", 3)
+
+    search_calls = [call for call in connection.cursor_obj.calls if call[1] is not None]
+    assert len(search_calls) == 2
+    for _, params in search_calls:
+        assert isinstance(params[0], FakeVector)
+        assert params[0] is params[3]
+        assert params[0].value == vector
 
 
 def test_existing_schema_must_have_expected_vector_and_hnsw_cosine_index():
