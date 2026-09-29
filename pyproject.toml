@@ -11,6 +11,7 @@ dependencies = ["numpy==1.26.4", "python-dotenv==1.0.1"]
 
 [project.optional-dependencies]
 full = ["datasets==2.21.0", "openai==1.51.0", "pgvector==0.3.6", "psycopg[binary]==3.2.3", "pypdf==5.1.0", "sentence-transformers==3.2.1", "jupyter==1.1.1", "nbformat==5.10.4", "nbclient==0.10.0"]
+plot = ["matplotlib==3.9.2"]
 dev = ["pytest==8.3.3", "ruff==0.6.9", "nbformat==5.10.4"]
 
 [tool.setuptools.packages.find]
