@@ -95,12 +95,48 @@ def answer_metrics(
     citations: list[str] | None = None,
     passages: list[dict] | None = None,
 ) -> dict:
+    generated = generated if isinstance(generated, str) else ""
     result = {
         "status": status,
         "answer_chars": len(generated),
         "answer_words": len(generated.split()),
         "quality_metric_support": "vidore_deterministic_token_f1; no LLM judge",
     }
+    if status.lower() not in {"ok", "success"} or not generated.strip():
+        reason = (
+            "answer generation was not successful"
+            if status.lower() not in {"ok", "success"}
+            else "generated answer is blank"
+        )
+        result.update(
+            {
+                "correctness": {"value": None, "available": False, "reason": reason},
+                "normalized_exact_match": None,
+                "normalized_exact_match_method": None,
+                "normalized_exact_match_scope": None,
+                "answer_relevance": {"value": None, "available": False, "reason": reason},
+                "retrieval_passage_citation_completeness": {
+                    "value": None,
+                    "available": False,
+                    "reason": reason,
+                },
+                "citation_validity": {"value": None, "available": False, "reason": reason},
+                "claims": [],
+                "claim_level_citation_completeness": {
+                    "value": None,
+                    "available": False,
+                    "reason": reason,
+                },
+                "groundedness": {
+                    "value": None,
+                    "available": False,
+                    "label": "lexical_heuristic_not_semantic_entailment",
+                    "reason": reason,
+                },
+                "citation_details": {"available": False, "reason": reason},
+            }
+        )
+        return result
     answers = _answer_list(acceptable_answers)
     if answers:
         result["correctness"] = {

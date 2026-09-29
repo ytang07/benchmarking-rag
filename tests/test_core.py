@@ -476,13 +476,56 @@ def test_vidore_result_persists_answer_provenance_and_timing(tmp_path):
     assert result["retrieved_passages"][0]["page"] == 4
     assert result["retrieved_passages"][0]["document_id"] == "doc-1"
     assert result["retrieved_passages"][0]["text"] == "Evidence"
-    assert result["answer_metrics"]["correctness"]["available"] is True
+    assert result["answer_metrics"]["correctness"]["available"] is False
+    assert result["answer_metrics"]["correctness"]["value"] is None
+    assert result["answer_metrics"]["answer_relevance"]["value"] is None
+    assert result["answer_metrics"]["groundedness"]["value"] is None
     assert result["timing_seconds"]["initialization"] == 0.0
     assert result["vidore_provenance"]["corpus"]
     persisted = (tmp_path / "results.jsonl").read_text()
     assert '"arbitrary": {"value": "kept"}' in persisted
     assert result["timing_seconds"]["rag_evaluation"] >= 0
     assert '"retrieved_passages"' in (tmp_path / "results.jsonl").read_text()
+
+
+def test_gateway_error_and_blank_answer_do_not_score_reference_answers(monkeypatch):
+    data = pipeline.PreparedData(
+        "vidore",
+        documents=[{"id": "doc-1", "text": "Evidence"}],
+        queries=[{"id": "q-1", "text": "What?", "answer": "Expected"}],
+        qrels={"q-1": {"doc-1": 1.0}},
+    )
+    config = BenchmarkConfig.from_env(
+        {
+            "DATABRICKS_BASE_URL": "https://gateway",
+            "DATABRICKS_TOKEN": "token",
+            "DATABRICKS_MODEL": "model",
+        }
+    )
+    monkeypatch.setattr(
+        pipeline, "answer", lambda *args: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    error_result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=False)[0]
+    monkeypatch.setattr(pipeline, "answer", lambda *args: "")
+    blank_result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=False)[0]
+    for result in (error_result, blank_result):
+        metrics = result["answer_metrics"]
+        assert metrics["correctness"]["value"] is None
+        assert metrics["answer_relevance"]["value"] is None
+        assert metrics["retrieval_passage_citation_completeness"]["value"] is None
+        assert metrics["claim_level_citation_completeness"]["value"] is None
+        assert metrics["groundedness"]["value"] is None
+
+
+def test_prepared_scope_downgrades_complete_when_skipped_rows_are_present():
+    data = pipeline.PreparedData(
+        "vidore",
+        skipped=[{"id": "bad", "reason": "filtered"}],
+        evaluation_scope="complete",
+        provenance_scope="complete",
+    )
+    assert data.evaluation_scope == "bounded"
+    assert data.provenance_scope == "bounded"
 
 
 def test_notebook_is_vidore_three_model_workflow():

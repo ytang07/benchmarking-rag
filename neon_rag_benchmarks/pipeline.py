@@ -61,6 +61,20 @@ def _persist(path: str, records: list[dict]) -> None:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
 
 
+def _record_scopes(data: PreparedData) -> tuple[str, str, str, str]:
+    """Prevent late-added skipped rows from being emitted as complete scopes."""
+    evaluation_scope = data.evaluation_scope
+    evaluation_detail = data.evaluation_scope_detail
+    provenance_scope = data.provenance_scope
+    provenance_detail = data.provenance_scope_detail
+    if data.skipped:
+        if evaluation_scope == "complete":
+            evaluation_scope, evaluation_detail = "bounded", "filtered_rows"
+        if provenance_scope == "complete":
+            provenance_scope, provenance_detail = "bounded", "filtered_rows"
+    return evaluation_scope, evaluation_detail, provenance_scope, provenance_detail
+
+
 def _skip_records(
     data: PreparedData,
     model_key: str,
@@ -70,6 +84,7 @@ def _skip_records(
     dataset_initialization_seconds: float = 0.0,
     model_initialization_seconds: float = 0.0,
 ) -> list[dict]:
+    evaluation_scope, evaluation_detail, provenance_scope, provenance_detail = _record_scopes(data)
     return [
         {
             "dataset": data.dataset,
@@ -82,9 +97,9 @@ def _skip_records(
             "reason": reason,
             "skipped": data.skipped,
             "evaluation_scope": "skipped",
-            "evaluation_scope_detail": data.evaluation_scope_detail,
-            "provenance_scope": data.provenance_scope,
-            "provenance_scope_detail": data.provenance_scope_detail,
+            "evaluation_scope_detail": evaluation_detail,
+            "provenance_scope": provenance_scope,
+            "provenance_scope_detail": provenance_detail,
             "vidore_provenance": json_safe(data.native_provenance),
             "native_qrels": data.native_qrels,
             "qrels": {},
@@ -194,6 +209,7 @@ def _run_benchmark(
             _persist(config.results_path, records)
         return records
     records = []
+    evaluation_scope, evaluation_detail, provenance_scope, provenance_detail = _record_scopes(data)
     for query in queries:
         query_embedding_started = perf_counter()
         query_vector = (
@@ -338,14 +354,14 @@ def _run_benchmark(
             "qrel_threshold": config.qrel_min_score,
             "native_qrels": data.native_qrels,
             "qrels": data.qrels.get(query["id"], {}),
-            "evaluation_scope": data.evaluation_scope,
+            "evaluation_scope": evaluation_scope,
             "retrieval_metrics": retrieval_metrics,
             "skipped_count": len(data.skipped),
             "skipped": data.skipped,
             "dataset_metadata": data.metadata,
-            "provenance_scope": data.provenance_scope,
-            "evaluation_scope_detail": data.evaluation_scope_detail,
-            "provenance_scope_detail": data.provenance_scope_detail,
+            "provenance_scope": provenance_scope,
+            "evaluation_scope_detail": evaluation_detail,
+            "provenance_scope_detail": provenance_detail,
         }
         if not config.exact_scan:
             record["exact_unavailable_reason"] = "EXACT_SCAN=false"

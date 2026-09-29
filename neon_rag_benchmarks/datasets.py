@@ -51,6 +51,13 @@ class PreparedData:
             if self.provenance_scope_detail == "not_available":
                 self.provenance_scope_detail = self.provenance_scope
             self.provenance_scope = _canonical_scope(self.provenance_scope, provenance=True)
+        if self.skipped:
+            if self.evaluation_scope == "complete":
+                self.evaluation_scope = "bounded"
+                self.evaluation_scope_detail = "filtered_rows"
+            if self.provenance_scope == "complete":
+                self.provenance_scope = "bounded"
+                self.provenance_scope_detail = "filtered_rows"
 
 
 def validate_record(dataset: str, record: dict) -> str:
