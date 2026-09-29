@@ -62,7 +62,13 @@ def _persist(path: str, records: list[dict]) -> None:
 
 
 def _skip_records(
-    data: PreparedData, model_key: str, config: BenchmarkConfig, reason: str, run_id: str
+    data: PreparedData,
+    model_key: str,
+    config: BenchmarkConfig,
+    reason: str,
+    run_id: str,
+    dataset_initialization_seconds: float = 0.0,
+    model_initialization_seconds: float = 0.0,
 ) -> list[dict]:
     return [
         {
@@ -75,10 +81,18 @@ def _skip_records(
             "status": "skipped",
             "reason": reason,
             "skipped": data.skipped,
-            "evaluation_scope": data.evaluation_scope,
+            "evaluation_scope": "skipped",
+            "evaluation_scope_detail": data.evaluation_scope_detail,
             "provenance_scope": data.provenance_scope,
+            "provenance_scope_detail": data.provenance_scope_detail,
             "vidore_provenance": json_safe(data.native_provenance),
             "native_qrels": data.native_qrels,
+            "qrels": {},
+            "retrieval_metrics": None,
+            "retrieved_passages": [],
+            "answer": None,
+            "citations": [],
+            "answer_metrics": answer_metrics("", "skipped"),
             "timing_seconds": {
                 "embedding": 0.0,
                 "corpus_embedding": 0.0,
@@ -87,7 +101,10 @@ def _skip_records(
                 "hnsw_search": 0.0,
                 "exact_scan": 0.0,
                 "answer": 0.0,
-                "initialization": 0.0,
+                "initialization": model_initialization_seconds,
+                "model_initialization_seconds": model_initialization_seconds,
+                "dataset_initialization_seconds": dataset_initialization_seconds,
+                "rag_evaluation": 0.0,
                 "total": 0.0,
             },
         }
@@ -103,6 +120,7 @@ def _run_benchmark(
     persist: bool = True,
     run_id: str | None = None,
     _connection=None,
+    dataset_initialization_seconds: float = 0.0,
 ) -> list[dict]:
     """Run one dataset/model and emit one result for the configured chat model."""
     if data.dataset != "vidore":
@@ -113,7 +131,14 @@ def _run_benchmark(
         raise ValueError(f"Unknown embedding model {model_key}")
     run_id = run_id or str(uuid4())
     if not data.documents:
-        records = _skip_records(data, model_key, config, "no documents after validation", run_id)
+        records = _skip_records(
+            data,
+            model_key,
+            config,
+            "no documents after validation",
+            run_id,
+            dataset_initialization_seconds,
+        )
         if persist:
             _persist(config.results_path, records)
         return records
@@ -162,6 +187,8 @@ def _run_benchmark(
             config,
             "no queries supplied; provide QUERY_SOURCE for this dataset",
             run_id,
+            dataset_initialization_seconds,
+            initialization_seconds,
         )
         if persist:
             _persist(config.results_path, records)
@@ -222,8 +249,10 @@ def _run_benchmark(
         if relevant:
             metric_prefix = (
                 "native"
-                if data.native_qrels and data.evaluation_scope == "full_dataset"
-                else ("synthetic" if data.evaluation_scope == "synthetic" else "bounded_sample")
+                if data.native_qrels and data.evaluation_scope_detail == "full_dataset"
+                else (
+                    "synthetic" if data.evaluation_scope_detail == "synthetic" else "bounded_sample"
+                )
             )
             retrieval_metrics = {
                 f"{metric_prefix}_hnsw_recall@k": recall_at_k(
@@ -303,6 +332,8 @@ def _run_benchmark(
                 "total": phase_seconds,
                 "rag_evaluation": query_embedding_seconds + hnsw_seconds + exact_seconds,
                 "initialization": initialization_seconds,
+                "model_initialization_seconds": initialization_seconds,
+                "dataset_initialization_seconds": dataset_initialization_seconds,
             },
             "qrel_threshold": config.qrel_min_score,
             "native_qrels": data.native_qrels,
@@ -313,6 +344,8 @@ def _run_benchmark(
             "skipped": data.skipped,
             "dataset_metadata": data.metadata,
             "provenance_scope": data.provenance_scope,
+            "evaluation_scope_detail": data.evaluation_scope_detail,
+            "provenance_scope_detail": data.provenance_scope_detail,
         }
         if not config.exact_scan:
             record["exact_unavailable_reason"] = "EXACT_SCAN=false"
@@ -385,14 +418,32 @@ def run_benchmark(
     smoke: bool = False,
     persist: bool = True,
     run_id: str | None = None,
+    dataset_initialization_seconds: float = 0.0,
 ) -> list[dict]:
     """Run a benchmark and always rollback/close a live connection on every path."""
     if smoke or not data.documents:
-        return _run_benchmark(config, data, model_key, smoke, persist, run_id)
+        return _run_benchmark(
+            config,
+            data,
+            model_key,
+            smoke,
+            persist,
+            run_id,
+            dataset_initialization_seconds=dataset_initialization_seconds,
+        )
     connection = None
     try:
         connection = db.connect(config.require_database())
-        return _run_benchmark(config, data, model_key, smoke, persist, run_id, connection)
+        return _run_benchmark(
+            config,
+            data,
+            model_key,
+            smoke,
+            persist,
+            run_id,
+            connection,
+            dataset_initialization_seconds,
+        )
     except Exception:
         if connection is not None:
             connection.rollback()
@@ -426,6 +477,7 @@ def run_matrix(
     output = []
     selected_models = model_keys or tuple(MODELS)
     for dataset_name in selected_datasets:
+        dataset_initialization_started = perf_counter()
         if smoke:
             data = PreparedData(
                 dataset_name,
@@ -433,8 +485,10 @@ def run_matrix(
                 queries=[{"id": "smoke-query", "text": "How does vector retrieval work?"}],
                 qrels={"smoke-query": {"smoke-1": 1.0}},
                 native_qrels=False,
-                evaluation_scope="synthetic",
-                provenance_scope="synthetic",
+                evaluation_scope="bounded",
+                evaluation_scope_detail="synthetic",
+                provenance_scope="skipped",
+                provenance_scope_detail="synthetic",
             )
         else:
             raw = load_optional(
@@ -458,8 +512,17 @@ def run_matrix(
                 config.govdocs_max_document_bytes,
                 config.govdocs_max_text_bytes,
             )
+        dataset_initialization_seconds = perf_counter() - dataset_initialization_started
         for model_key in selected_models:
             output.extend(
-                run_benchmark(config, data, model_key, smoke=smoke, persist=persist, run_id=run_id)
+                run_benchmark(
+                    config,
+                    data,
+                    model_key,
+                    smoke=smoke,
+                    persist=persist,
+                    run_id=run_id,
+                    dataset_initialization_seconds=dataset_initialization_seconds,
+                )
             )
     return output

@@ -23,10 +23,12 @@ class PreparedData:
     qrels: dict[str, dict[str, float]] = field(default_factory=dict)
     skipped: list[dict[str, str]] = field(default_factory=list)
     native_qrels: bool = False
-    evaluation_scope: str = "incomplete"
+    evaluation_scope: str = "skipped"
+    evaluation_scope_detail: str = "incomplete"
     metadata: dict = field(default_factory=dict)
     native_provenance: dict = field(default_factory=dict)
-    provenance_scope: str = "not_available"
+    provenance_scope: str = "skipped"
+    provenance_scope_detail: str = "not_available"
 
 
 def validate_record(dataset: str, record: dict) -> str:
@@ -314,9 +316,10 @@ def prepare_records(
             "corpus": [json_safe(row) for row in corpus_rows],
             "queries": [json_safe(row) for row in query_rows],
         }
-        result.provenance_scope = (
-            "bounded_sample" if corpus_truncated or query_truncated else "complete"
+        result.provenance_scope_detail = (
+            "bounded_sample" if corpus_truncated or query_truncated else "full_dataset"
         )
+        result.provenance_scope = "bounded" if corpus_truncated or query_truncated else "complete"
         for row in corpus_rows[:max_rows]:
             doc_id = str(_get(row, "corpus_id", "id", "doc_id"))
             text = _get(row, "markdown", "text", "content")
@@ -371,7 +374,7 @@ def prepare_records(
                 "query_truncated": query_truncated,
             }
         )
-        result.metadata["evaluation_scope"] = (
+        result.evaluation_scope_detail = (
             "bounded_sample"
             if result.metadata["corpus_truncated"] or result.metadata["query_truncated"]
             else "full_dataset"
@@ -383,8 +386,14 @@ def prepare_records(
             or not qrel_doc_ids.issubset(indexed_ids)
             or result.skipped
         ):
-            result.metadata["evaluation_scope"] = "bounded_sample"
-        result.evaluation_scope = result.metadata["evaluation_scope"]
+            result.evaluation_scope_detail = "bounded_sample"
+        result.evaluation_scope = (
+            "complete" if result.evaluation_scope_detail == "full_dataset" else "bounded"
+        )
+        result.metadata["evaluation_scope"] = result.evaluation_scope_detail
+        result.metadata["evaluation_scope_detail"] = result.evaluation_scope_detail
+        result.metadata["provenance_scope"] = result.provenance_scope
+        result.metadata["provenance_scope_detail"] = result.provenance_scope_detail
     else:
         if name == "parsebench":
             rows = _reservoir_sample(_rows(raw) if raw is not None else (), max_rows, seed)

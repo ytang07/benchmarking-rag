@@ -56,7 +56,13 @@ def test_offline_matrix_executes_vidore_first_paths(tmp_path):
     assert len(results) == 3
     assert all(row["status"] == "ok" for row in results)
     assert results[0]["retrieval_metrics"]["synthetic_hnsw_recall@k"] == 1.0
-    assert results[0]["evaluation_scope"] == "synthetic"
+    assert results[0]["evaluation_scope"] == "bounded"
+    assert results[0]["evaluation_scope_detail"] == "synthetic"
+    assert results[0]["provenance_scope"] == "skipped"
+    assert results[0]["provenance_scope_detail"] == "synthetic"
+    assert results[0]["timing_seconds"]["dataset_initialization_seconds"] >= 0
+    assert results[0]["timing_seconds"]["model_initialization_seconds"] == 0.0
+    assert results[0]["timing_seconds"]["rag_evaluation"] >= 0
     assert results[0]["native_qrels"] is False
     assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 3
     assert len({row["run_id"] for row in results}) == 1
@@ -274,8 +280,9 @@ def test_vidore_bounded_sample_renames_metrics_and_preserves_retained_qrels():
     }
     data = prepare_records("vidore", raw, max_rows=1)
     assert data.metadata["evaluation_scope"] == "bounded_sample"
-    assert data.evaluation_scope == "bounded_sample" and data.native_qrels is True
-    assert data.provenance_scope == "bounded_sample"
+    assert data.evaluation_scope == "bounded" and data.native_qrels is True
+    assert data.evaluation_scope_detail == "bounded_sample"
+    assert data.provenance_scope == "bounded"
     assert len(data.native_provenance["corpus"]) == 1
     assert len(data.native_provenance["queries"]) == 1
     assert data.qrels == {"q1": {"d1": 1.0}}
@@ -285,7 +292,7 @@ def test_vidore_bounded_sample_renames_metrics_and_preserves_retained_qrels():
     metrics = result[0]["retrieval_metrics"]
     assert "bounded_sample_hnsw_recall@k" in metrics
     assert "native_hnsw_recall@k" not in metrics
-    assert result[0]["provenance_scope"] == "bounded_sample"
+    assert result[0]["provenance_scope"] == "bounded"
 
 
 def test_native_answer_fallback_normalizes_empty_raw_answers():
@@ -300,6 +307,25 @@ def test_native_answer_fallback_normalizes_empty_raw_answers():
     assert pipeline._native_answers({"raw_answers": ["", 3], "answer": "native"}) == "native"
 
 
+def test_skipped_result_has_evaluation_schema(tmp_path):
+    data = pipeline.PreparedData(
+        "vidore",
+        evaluation_scope="bounded",
+        evaluation_scope_detail="incomplete",
+        provenance_scope="bounded",
+        provenance_scope_detail="bounded_sample",
+    )
+    config = BenchmarkConfig.from_env({"RESULTS_PATH": str(tmp_path / "results.jsonl")})
+    result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=True)[0]
+    assert result["status"] == "skipped"
+    assert result["evaluation_scope"] == "skipped"
+    assert result["provenance_scope"] == "bounded"
+    assert result["answer"] is None
+    assert result["citations"] == []
+    assert result["retrieved_passages"] == []
+    assert result["qrels"] == {}
+
+
 def test_exact_scan_false_does_not_report_unmeasured_exact_metrics():
     config = BenchmarkConfig.from_env({"EXACT_SCAN": "false"})
     data = pipeline.PreparedData(
@@ -307,7 +333,8 @@ def test_exact_scan_false_does_not_report_unmeasured_exact_metrics():
         documents=[{"id": "d", "text": "text"}],
         queries=[{"id": "q", "text": "text"}],
         qrels={"q": {"d": 1.0}},
-        evaluation_scope="bounded_sample",
+        evaluation_scope="bounded",
+        evaluation_scope_detail="bounded_sample",
     )
     result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=False)[0]
     assert "exact_recall@k" not in result["retrieval_metrics"]
@@ -358,6 +385,8 @@ def test_vidore_native_answers_and_evidence_are_retained():
     assert data.queries[0]["raw_answers"] == ["Evidence"]
     assert data.documents[0]["page_number"] == 4
     assert data.documents[0]["bbox"] == [1, 2, 3, 4]
+    assert data.provenance_scope == "complete"
+    assert data.evaluation_scope == "complete"
     assert data.documents[0]["metadata"] == {"native": "b'bytes'"}
     assert data.documents[0]["native_provenance"]["arbitrary_native_field"] == {
         "nested": [1, "b'raw'"]
@@ -416,7 +445,8 @@ def test_vidore_result_persists_answer_provenance_and_timing(tmp_path):
         ],
         qrels={"q-1": {"doc-1": 1.0}},
         native_qrels=True,
-        evaluation_scope="full_dataset",
+        evaluation_scope="complete",
+        evaluation_scope_detail="full_dataset",
         native_provenance={
             "corpus": [{"id": "doc-1", "arbitrary": {"value": "kept"}}],
             "queries": [{"id": "q-1", "arbitrary": [1, 2, 3]}],
