@@ -295,6 +295,24 @@ def test_vidore_bounded_sample_renames_metrics_and_preserves_retained_qrels():
     assert result[0]["provenance_scope"] == "bounded"
 
 
+def test_non_truncated_filtered_vidore_rows_downgrade_provenance_scope():
+    data = prepare_records(
+        "vidore",
+        {
+            "corpus": [{"id": "d1", "markdown": "kept"}, {"id": "d2", "markdown": ""}],
+            "queries": [{"id": "q1", "query": "kept"}, {"id": "q2", "query": ""}],
+            "qrels": [{"query_id": "q1", "corpus_id": "d1", "score": 1}],
+        },
+        max_rows=2,
+    )
+    assert data.metadata["corpus_truncated"] is False
+    assert data.metadata["query_truncated"] is False
+    assert data.provenance_scope == "bounded"
+    assert data.provenance_scope_detail == "filtered_rows"
+    assert len(data.native_provenance["corpus"]) == 2
+    assert len(data.native_provenance["queries"]) == 2
+
+
 def test_native_answer_fallback_normalizes_empty_raw_answers():
     assert pipeline._native_answers({"raw_answers": [], "answer": "native"}) == "native"
     assert pipeline._native_answers({"raw_answers": [""], "answer": "native"}) == "native"

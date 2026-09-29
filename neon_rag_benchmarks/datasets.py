@@ -15,6 +15,18 @@ DATASET_INFO = {
 }
 
 
+def _canonical_scope(value: str, provenance: bool = False) -> str:
+    if value in {"complete", "bounded", "skipped"}:
+        return value
+    if value in {"full_dataset"}:
+        return "complete"
+    if value in {"bounded_sample"}:
+        return "bounded"
+    if value == "synthetic":
+        return "skipped" if provenance else "bounded"
+    return "skipped"
+
+
 @dataclass
 class PreparedData:
     dataset: str
@@ -29,6 +41,16 @@ class PreparedData:
     native_provenance: dict = field(default_factory=dict)
     provenance_scope: str = "skipped"
     provenance_scope_detail: str = "not_available"
+
+    def __post_init__(self):
+        if self.evaluation_scope not in {"complete", "bounded", "skipped"}:
+            if self.evaluation_scope_detail == "incomplete":
+                self.evaluation_scope_detail = self.evaluation_scope
+            self.evaluation_scope = _canonical_scope(self.evaluation_scope)
+        if self.provenance_scope not in {"complete", "bounded", "skipped"}:
+            if self.provenance_scope_detail == "not_available":
+                self.provenance_scope_detail = self.provenance_scope
+            self.provenance_scope = _canonical_scope(self.provenance_scope, provenance=True)
 
 
 def validate_record(dataset: str, record: dict) -> str:
@@ -316,10 +338,6 @@ def prepare_records(
             "corpus": [json_safe(row) for row in corpus_rows],
             "queries": [json_safe(row) for row in query_rows],
         }
-        result.provenance_scope_detail = (
-            "bounded_sample" if corpus_truncated or query_truncated else "full_dataset"
-        )
-        result.provenance_scope = "bounded" if corpus_truncated or query_truncated else "complete"
         for row in corpus_rows[:max_rows]:
             doc_id = str(_get(row, "corpus_id", "id", "doc_id"))
             text = _get(row, "markdown", "text", "content")
@@ -350,6 +368,8 @@ def prepare_records(
                         query[key] = json_safe(value)
                 result.queries.append(query)
                 retained_query_ids.add(query_id)
+            else:
+                result.skipped.append({"id": query_id, "reason": "missing query text"})
         qrels_seen = 0
         qrels_retained = 0
         for row in qrel_rows:
@@ -390,6 +410,15 @@ def prepare_records(
         result.evaluation_scope = (
             "complete" if result.evaluation_scope_detail == "full_dataset" else "bounded"
         )
+        if corpus_truncated or query_truncated:
+            result.provenance_scope = "bounded"
+            result.provenance_scope_detail = "bounded_sample"
+        elif result.skipped:
+            result.provenance_scope = "bounded"
+            result.provenance_scope_detail = "filtered_rows"
+        else:
+            result.provenance_scope = "complete"
+            result.provenance_scope_detail = "full_dataset"
         result.metadata["evaluation_scope"] = result.evaluation_scope_detail
         result.metadata["evaluation_scope_detail"] = result.evaluation_scope_detail
         result.metadata["provenance_scope"] = result.provenance_scope
