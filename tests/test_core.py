@@ -60,7 +60,8 @@ def test_offline_matrix_executes_vidore_first_paths(tmp_path):
     results = run_matrix(config, smoke=True, persist=True)
     assert len(results) == 3
     assert all(row["status"] == "ok" for row in results)
-    assert results[0]["retrieval_metrics"]["synthetic_hnsw_recall@k"] == 1.0
+    assert results[0]["retrieval_metrics"]["bounded_sample_hnsw_recall@k"] == 1.0
+    assert not any(key.startswith("synthetic_") for key in results[0]["retrieval_metrics"])
     assert results[0]["evaluation_scope"] == "bounded"
     assert results[0]["evaluation_scope_detail"] == "synthetic"
     assert results[0]["provenance_scope"] == "skipped"
@@ -105,7 +106,8 @@ def test_vector_and_answer_validation(tmp_path):
         load_optional("govdocs")
     with pytest.raises(ValueError, match="raw PDF exceeds"):
         _extract_pdf({"bytes": b"too large"}, max_bytes=2)
-    assert validate_record("govdocs", {"id": "x", "broken_pdf": "false"}) == "x"
+    with pytest.raises(ValueError, match="Vidore-only record validation"):
+        validate_record("govdocs", {"id": "x", "broken_pdf": "false"})
     with pytest.raises(ValueError):
         validate_record("govdocs", {"id": "x", "broken_pdf": "unknown"})
 
@@ -536,6 +538,17 @@ def test_prepared_scope_downgrades_complete_when_skipped_rows_are_present():
     )
     assert data.evaluation_scope == "bounded"
     assert data.provenance_scope == "bounded"
+
+
+def test_prepared_metadata_drops_contradictory_canonical_scope_keys():
+    data = pipeline.PreparedData(
+        "vidore",
+        metadata={"evaluation_scope": "complete", "provenance_scope": "complete"},
+    )
+    assert "evaluation_scope" not in data.metadata
+    assert "provenance_scope" not in data.metadata
+    assert data.metadata["evaluation_scope_detail"] == "complete"
+    assert data.metadata["provenance_scope_detail"] == "complete"
 
 
 def test_notebook_is_vidore_three_model_workflow():

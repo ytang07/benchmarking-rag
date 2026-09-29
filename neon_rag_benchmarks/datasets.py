@@ -10,8 +10,6 @@ from pathlib import Path
 
 DATASET_INFO = {
     "vidore": "vidore/vidore_v3_industrial: corpus/test markdown, queries/test query, qrels/test query_id/corpus_id/score; native qrels.",
-    "parsebench": "llamaindex/ParseBench parse-bench: text_content split/expected_markdown; no native qrels, supply/generated queries.",
-    "govdocs": "BEE-spoke-data/govdocs1-pdf-source index/sample: metadata and PDFs, no extracted text; filter broken_pdf=false and supply/generated queries.",
 }
 
 
@@ -43,6 +41,11 @@ class PreparedData:
     provenance_scope_detail: str = "not_available"
 
     def __post_init__(self):
+        for scope_key in ("evaluation_scope", "provenance_scope"):
+            if scope_key in self.metadata:
+                detail_key = f"{scope_key}_detail"
+                self.metadata.setdefault(detail_key, self.metadata[scope_key])
+                self.metadata.pop(scope_key)
         if self.evaluation_scope not in {"complete", "bounded", "skipped"}:
             if self.evaluation_scope_detail == "incomplete":
                 self.evaluation_scope_detail = self.evaluation_scope
@@ -61,14 +64,10 @@ class PreparedData:
 
 
 def validate_record(dataset: str, record: dict) -> str:
-    if dataset not in DATASET_INFO:
-        raise ValueError(f"Unknown dataset {dataset}; choose {tuple(DATASET_INFO)}")
-    if dataset == "vidore" and not record.get("text", record.get("markdown")):
+    if dataset != "vidore":
+        raise ValueError(f"Vidore-only record validation does not support dataset={dataset!r}")
+    if not record.get("text", record.get("markdown")):
         raise ValueError("Vidore record needs markdown text")
-    if dataset == "parsebench" and not record.get("text_content"):
-        raise ValueError("ParseBench record needs text_content")
-    if dataset == "govdocs" and _is_broken(record.get("broken_pdf")):
-        raise ValueError("GovDocs broken_pdf must be an explicit false value")
     return str(record.get("id", record.get("doc_id", "")))
 
 

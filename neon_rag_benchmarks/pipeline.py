@@ -275,7 +275,7 @@ def _run_benchmark(
                 if data.native_qrels
                 and evaluation_scope == "complete"
                 and evaluation_detail == "full_dataset"
-                else ("synthetic" if evaluation_detail == "synthetic" else "bounded_sample")
+                else "bounded_sample"
             )
             retrieval_metrics = {
                 f"{metric_prefix}_hnsw_recall@k": recall_at_k(
