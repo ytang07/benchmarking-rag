@@ -76,6 +76,50 @@ def test_offline_matrix_executes_vidore_first_paths(tmp_path):
     assert {row["chat_model"] for row in results} == {None}
 
 
+def test_direct_benchmark_honors_configured_persistence(tmp_path):
+    result_path = tmp_path / "direct.jsonl"
+    config = BenchmarkConfig.from_env(
+        {"PERSIST_RESULTS": "false", "RESULTS_PATH": str(result_path)}
+    )
+    data = pipeline.PreparedData(
+        "vidore",
+        documents=[{"id": "doc-1", "text": "Evidence"}],
+        queries=[{"id": "q-1", "text": "What?"}],
+        qrels={"q-1": {"doc-1": 1.0}},
+    )
+
+    pipeline.run_benchmark(config, data, "minilm", smoke=True)
+    assert not result_path.exists()
+
+    pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=True)
+    assert len(result_path.read_text().splitlines()) == 1
+
+
+def test_live_vidore_matrix_can_skip_unavailable_gateway(monkeypatch):
+    config = BenchmarkConfig.from_env({})
+    raw = {
+        "corpus": [{"id": "doc-1", "markdown": "Evidence"}],
+        "queries": [{"id": "q-1", "query": "What?"}],
+        "qrels": [{"query_id": "q-1", "corpus_id": "doc-1", "score": 1}],
+    }
+    monkeypatch.setattr(pipeline, "load_optional", lambda *args: raw)
+    monkeypatch.setattr(
+        BenchmarkConfig, "require_gateway", lambda self: pytest.fail("gateway is optional")
+    )
+    original_run_benchmark = pipeline.run_benchmark
+
+    def offline_retrieval(config, data, model_key, **kwargs):
+        kwargs.pop("smoke")
+        return original_run_benchmark(config, data, model_key, smoke=True, **kwargs)
+
+    monkeypatch.setattr(pipeline, "run_benchmark", offline_retrieval)
+    result = run_matrix(config, smoke=False, persist=False, model_keys=("minilm",))[0]
+
+    assert result["retrieval_metrics"]
+    assert result["answer"] is None
+    assert result["answer_metrics"]["status"] == "skipped"
+
+
 def test_public_workflow_rejects_non_vidore_datasets():
     config = BenchmarkConfig.from_env({})
     with pytest.raises(ValueError, match="Vidore-only workflow"):

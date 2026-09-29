@@ -439,11 +439,13 @@ def run_benchmark(
     data: PreparedData,
     model_key: str,
     smoke: bool = False,
-    persist: bool = True,
+    persist: bool | None = None,
     run_id: str | None = None,
     dataset_initialization_seconds: float = 0.0,
 ) -> list[dict]:
     """Run a benchmark and always rollback/close a live connection on every path."""
+    if persist is None:
+        persist = config.persist_results
     if smoke or not data.documents:
         return _run_benchmark(
             config,
@@ -493,8 +495,6 @@ def run_matrix(
             "Vidore-only workflow accepts dataset_names containing only 'vidore'; "
             f"unsupported dataset(s): {unsupported}"
         )
-    if not smoke:
-        config.require_gateway()
     # EXPERIMENT_ID is a human label; every invocation gets a fresh immutable run id.
     run_id = str(uuid4())
     output = []
