@@ -9,7 +9,7 @@ from . import db
 from .config import BenchmarkConfig, MODELS
 from .datasets import PreparedData, json_safe, load_optional, prepare_records, smoke_documents
 from .embeddings import embed_query, embed_texts, warm_model
-from .gateway import answer
+from .gateway import answer, judge_answer
 from .metrics import answer_metrics, exact_cosine_search, mrr_at_k, parse_citations, recall_at_k
 from .schema import validate_vectors
 
@@ -115,6 +115,13 @@ def _skip_records(
             "answer": None,
             "citations": [],
             "answer_metrics": answer_metrics("", "skipped"),
+            "judge": {
+                "status": "unavailable",
+                "available": False,
+                "value": None,
+                "model": config.judge_model,
+                "reason": "benchmark record was skipped",
+            },
             "timing_seconds": {
                 "embedding": 0.0,
                 "corpus_embedding": 0.0,
@@ -369,10 +376,22 @@ def _run_benchmark(
             "provenance_scope": provenance_scope,
             "evaluation_scope_detail": evaluation_detail,
             "provenance_scope_detail": provenance_detail,
+            "judge": {
+                "status": "unavailable",
+                "available": False,
+                "value": None,
+                "model": config.judge_model,
+                "reason": "LLM_JUDGE_ENABLED=false",
+            },
         }
         if not config.exact_scan:
             record["exact_unavailable_reason"] = "EXACT_SCAN=false"
-        if not config.gateway_model or not config.gateway_base_url or not config.gateway_token:
+        if (
+            smoke
+            or not config.gateway_model
+            or not config.gateway_base_url
+            or not config.gateway_token
+        ):
             record["answer"] = None
             record["citations"] = []
             record["answer_metrics"] = answer_metrics(
@@ -421,12 +440,66 @@ def _run_benchmark(
                 )
                 record["answer_metrics"]["reason"] = str(exc)
             record["timing_seconds"]["answer"] = perf_counter() - answer_started
+        judge_started = perf_counter()
+        if smoke:
+            record["judge"]["reason"] = "smoke mode disables gateway answer and judge calls"
+        elif not config.judge_enabled:
+            record["judge"]["reason"] = "LLM_JUDGE_ENABLED=false"
+        elif not config.gateway_base_url or not config.gateway_token:
+            record["judge"]["reason"] = "gateway base URL or token not configured"
+        elif not isinstance(record.get("answer"), str) or not record["answer"].strip():
+            record["judge"]["reason"] = "generated answer unavailable"
+        else:
+            try:
+                judged = judge_answer(
+                    query["text"],
+                    context,
+                    record["answer"],
+                    config.judge_model,
+                    config.gateway_base_url,
+                    config.gateway_token,
+                )
+                record["judge"] = {
+                    "status": "ok",
+                    "available": True,
+                    "value": judged["score"],
+                    "model": config.judge_model,
+                    **judged,
+                }
+                record["answer_metrics"]["answer_relevance"] = {
+                    "value": judged["score"],
+                    "available": True,
+                    "status": "ok",
+                    "method": "llm_judge",
+                    "model": config.judge_model,
+                    "label": judged["label"],
+                    "rationale": judged["rationale"],
+                }
+            except Exception as exc:
+                record["judge"] = {
+                    "status": "error",
+                    "available": False,
+                    "value": None,
+                    "model": config.judge_model,
+                    "reason": str(exc),
+                }
+                record["answer_metrics"]["answer_relevance"] = {
+                    "value": None,
+                    "available": False,
+                    "status": "error",
+                    "method": "llm_judge",
+                    "model": config.judge_model,
+                    "reason": str(exc),
+                }
+        record["timing_seconds"]["judge"] = perf_counter() - judge_started
         record["timing_seconds"]["total"] = phase_seconds + record["timing_seconds"]["answer"]
+        record["timing_seconds"]["total"] += record["timing_seconds"]["judge"]
         record["timing_seconds"]["rag_evaluation"] = (
             query_embedding_seconds
             + hnsw_seconds
             + exact_seconds
             + record["timing_seconds"]["answer"]
+            + record["timing_seconds"]["judge"]
         )
         records.append(record)
     if persist:

@@ -1,0 +1,30 @@
+{
+  "tasks": {
+    "dataset-selection": {
+      "kind": "search",
+      "agent": "pi",
+      "conversation_id": "bdd54d00e7af4c9884312220d633abd9",
+      "status": "complete"
+    },
+    "neon-rag-benchmarks": {
+      "kind": "implement",
+      "agent": "codex",
+      "worktree": "/Users/yujian/Documents/workspace/bench-it/.worktrees/neon-rag-benchmarks",
+      "branch": "polly/neon-rag-benchmarks",
+      "conversation_id": "6b9afe897f7149faadf4cfae7e4cb0f1",
+      "head": "ec19b2fba95e05a1e7e1df26da94f4ec47ff27ee",
+      "status": "ready-for-human-merge",
+      "pr": null
+    },
+    "review-neon-rag-benchmarks-final-v6": {
+      "kind": "review",
+      "agent": "pi",
+      "conversation_id": "dddb0d9a53d44a78b80316fee21bd214",
+      "base": "aec1b71",
+      "head": "ec19b2fba95e05a1e7e1df26da94f4ec47ff27ee",
+      "diff": "/Users/yujian/Documents/workspace/bench-it/.polly/neon-rag-benchmarks-final-v6.diff",
+      "status": "passed",
+      "blocking_issues": 0
+    }
+  }
+}

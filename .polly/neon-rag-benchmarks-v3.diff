@@ -1,0 +1,1143 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..6dc5bc9
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,20 @@
++DATABASE_URL=postgresql://user:password@host/dbname?sslmode=require
++DATABRICKS_BASE_URL=https://your-workspace.cloud.databricks.com/serving-endpoints
++DATABRICKS_TOKEN=
++DATABRICKS_CHAT_ENDPOINT_1=
++DATABRICKS_CHAT_ENDPOINT_2=
++DATABRICKS_CHAT_ENDPOINT_3=
++BENCHMARK_SEED=7
++PARSEBENCH_MAX_ROWS=1000
++GOVDOCS_MAX_DOCUMENTS=100
++GOVDOCS_MAX_BYTES=1000000000
++HNSW_M=16
++HNSW_EF_CONSTRUCTION=128
++HNSW_EF_SEARCH=40
++CHUNK_SIZE=800
++CHUNK_OVERLAP=80
++TOP_K=10
++QREL_MIN_SCORE=1
++RESULTS_PATH=results/benchmark.jsonl
++QUERY_SOURCE=
++GOVDOCS_PDF_EXTRACTOR=pypdf
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..d389770
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,8 @@
++.venv/
++.env
++.ipynb_checkpoints/
++__pycache__/
++.pytest_cache/
++*.egg-info/
++data/
++results/
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..0398e31
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,23 @@
++# Neon + pgvector HNSW RAG benchmarks
++
++This Python 3.11 suite measures a reproducible 3 × 3 × 3 matrix: Vidore, ParseBench, and GovDocs × the three local sentence-transformers models × three configurable Databricks AI Gateway chat endpoints. The matrix is described in [`notebooks/benchmark_matrix.ipynb`](notebooks/benchmark_matrix.ipynb).
++
++Vidore (`vidore/vidore_v3_industrial`) is the small, native-evaluation dataset: its corpus/test markdown, queries/test query, and qrels/test query_id/corpus_id/score are used for retrieval metrics. ParseBench (`llamaindex/ParseBench`, parse-bench config, `text_content`/`expected_markdown`) is medium (~169,011 rows) and has no native qrels, so provide or generate queries. GovDocs (`BEE-spoke-data/govdocs1-pdf-source`) is large: index/sample configs contain metadata and PDFs but no extracted text; the adapter filters `broken_pdf=false` and uses document/byte limits. ParseBench and GovDocs are intentionally opt-in; the suite never claims their full data is locally available.
++
++## Setup
++
++```bash
++python3.11 -m venv .venv && source .venv/bin/activate
++python -m pip install -e '.[full,dev]'
++cp .env.example .env   # fill DATABASE_URL and gateway values for live runs
++python -m neon_rag_benchmarks.smoke
++pytest -q
++```
++
++The smoke command is deterministic and uses no Neon, Hugging Face, or Databricks credentials. `BenchmarkConfig.from_env()` loads `.env` through python-dotenv. For live work, set all three `DATABRICKS_CHAT_ENDPOINT_*` values and run the notebook with `SMOKE = False`, or call `run_matrix(BenchmarkConfig.from_env(), smoke=False)`. This performs bounded dataset loading, validation, chunking, local embedding, Neon insertion, HNSW and exact retrieval, qrels evaluation, answer generation, phase timing, and JSONL result persistence; each dataset/model/endpoint combination is a separate result record. Endpoint names are passed to OpenAI-compatible `chat.completions.create`; no model names are hardcoded. The local models are exactly `nomic-ai/nomic-embed-text-v1.5` (768, `search_document:`/`search_query:`, remote code enabled), `sentence-transformers/all-MiniLM-L6-v2` (384), and `sentence-transformers/all-mpnet-base-v2` (768).
++
++Neon setup creates `vector` before registering pgvector with psycopg, then creates a dimension-specific table and HNSW cosine index. Each model uses an isolated table and clears its dataset before ingestion. Every live query compares HNSW with an exact pgvector scan. Record embedding, ingestion, separate HNSW/exact-scan, and answer seconds. `QREL_MIN_SCORE` is an inclusive threshold (`score >= threshold`); answer metrics are reference-based normalized exact match only when a query source supplies `reference_answer`, plus length/status. No unsupported truth/quality score is claimed.
++
++ParseBench and GovDocs accept `QUERY_SOURCE` as JSONL/CSV with `query_id,text`, optional `relevant_doc_ids`/`qrels`, and optional `reference_answer`. Without it, bounded deterministic queries are generated from extracted text and are explicitly marked as having no native qrels. GovDocs filters `broken_pdf=true` and extracts bounded PDF bytes with optional `pypdf`; missing extractor, invalid PDFs, and missing text become per-document skip records with reasons.
++
++For reproducibility, pin the requirements and keep downloaded Hugging Face artifacts in a controlled cache. Dataset adapters should be extended with the relevant `datasets` loading configuration when doing full ingestion; the notebook's smoke mode remains the recommended first validation.
+diff --git a/neon_rag_benchmarks/__init__.py b/neon_rag_benchmarks/__init__.py
+new file mode 100644
+index 0000000..2219a45
+--- /dev/null
++++ b/neon_rag_benchmarks/__init__.py
+@@ -0,0 +1,3 @@
++"""Neon + pgvector RAG benchmark toolkit."""
++
++__version__ = "0.1.0"
+diff --git a/neon_rag_benchmarks/config.py b/neon_rag_benchmarks/config.py
+new file mode 100644
+index 0000000..6ce7e2b
+--- /dev/null
++++ b/neon_rag_benchmarks/config.py
+@@ -0,0 +1,96 @@
++"""Validated environment configuration; imports no optional integration packages."""
++
++from dataclasses import dataclass
++import os
++
++MODELS = {
++    "nomic": ("nomic-ai/nomic-embed-text-v1.5", 768),
++    "minilm": ("sentence-transformers/all-MiniLM-L6-v2", 384),
++    "mpnet": ("sentence-transformers/all-mpnet-base-v2", 768),
++}
++DATASETS = ("vidore", "parsebench", "govdocs")
++
++
++@dataclass(frozen=True)
++class BenchmarkConfig:
++    database_url: str | None
++    gateway_base_url: str | None
++    gateway_token: str | None
++    chat_endpoints: tuple[str | None, str | None, str | None]
++    seed: int = 7
++    parsebench_max_rows: int = 1000
++    govdocs_max_documents: int = 100
++    govdocs_max_bytes: int = 1_000_000_000
++    hnsw_m: int = 16
++    hnsw_ef_construction: int = 128
++    hnsw_ef_search: int = 40
++    chunk_size: int = 800
++    chunk_overlap: int = 80
++    top_k: int = 10
++    qrel_min_score: float = 1.0
++    results_path: str = "results/benchmark.jsonl"
++    query_source: str | None = None
++    govdocs_pdf_extractor: str = "pypdf"
++
++    @classmethod
++    def from_env(cls, environ: dict[str, str] | None = None) -> "BenchmarkConfig":
++        if environ is None:
++            try:
++                from dotenv import load_dotenv
++
++                load_dotenv()
++            except ImportError:
++                pass
++        e = os.environ if environ is None else environ
++
++        def integer(name: str, default: int, minimum: int = 1) -> int:
++            try:
++                value = int(e.get(name, str(default)))
++            except ValueError as exc:
++                raise ValueError(f"{name} must be an integer") from exc
++            if value < minimum:
++                raise ValueError(f"{name} must be >= {minimum}")
++            return value
++
++        try:
++            threshold = float(e.get("QREL_MIN_SCORE", "1"))
++        except ValueError as exc:
++            raise ValueError("QREL_MIN_SCORE must be numeric") from exc
++        if threshold < 0:
++            raise ValueError("QREL_MIN_SCORE must be >= 0")
++        chunk_size = integer("CHUNK_SIZE", 800)
++        chunk_overlap = integer("CHUNK_OVERLAP", 80, 0)
++        if chunk_overlap >= chunk_size:
++            raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE")
++        return cls(
++            e.get("DATABASE_URL"),
++            e.get("DATABRICKS_BASE_URL"),
++            e.get("DATABRICKS_TOKEN"),
++            tuple(e.get(f"DATABRICKS_CHAT_ENDPOINT_{i}") for i in range(1, 4)),
++            integer("BENCHMARK_SEED", 7, 0),
++            integer("PARSEBENCH_MAX_ROWS", 1000),
++            integer("GOVDOCS_MAX_DOCUMENTS", 100),
++            integer("GOVDOCS_MAX_BYTES", 1),
++            integer("HNSW_M", 16),
++            integer("HNSW_EF_CONSTRUCTION", 128),
++            integer("HNSW_EF_SEARCH", 1),
++            chunk_size,
++            chunk_overlap,
++            integer("TOP_K", 10),
++            threshold,
++            e.get("RESULTS_PATH", "results/benchmark.jsonl"),
++            e.get("QUERY_SOURCE") or None,
++            e.get("GOVDOCS_PDF_EXTRACTOR", "pypdf"),
++        )
++
++    def require_database(self) -> str:
++        if not self.database_url:
++            raise RuntimeError("DATABASE_URL is required for Neon operations")
++        return self.database_url
++
++    def require_gateway(self) -> tuple[str, str, tuple[str, str, str]]:
++        if not self.gateway_base_url or not self.gateway_token or not all(self.chat_endpoints):
++            raise RuntimeError(
++                "DATABRICKS_BASE_URL, DATABRICKS_TOKEN, and all three chat endpoints are required"
++            )
++        return self.gateway_base_url, self.gateway_token, self.chat_endpoints  # type: ignore
+diff --git a/neon_rag_benchmarks/datasets.py b/neon_rag_benchmarks/datasets.py
+new file mode 100644
+index 0000000..a88471a
+--- /dev/null
++++ b/neon_rag_benchmarks/datasets.py
+@@ -0,0 +1,240 @@
++"""Dataset adapters. Only Vidore supplies native qrels; other datasets require queries."""
++
++from dataclasses import dataclass, field
++import csv
++import json
++import random
++from io import BytesIO
++from pathlib import Path
++
++DATASET_INFO = {
++    "vidore": "vidore/vidore_v3_industrial: corpus/test markdown, queries/test query, qrels/test query_id/corpus_id/score; native qrels.",
++    "parsebench": "llamaindex/ParseBench parse-bench: text_content split/expected_markdown; no native qrels, supply/generated queries.",
++    "govdocs": "BEE-spoke-data/govdocs1-pdf-source index/sample: metadata and PDFs, no extracted text; filter broken_pdf=false and supply/generated queries.",
++}
++
++
++@dataclass
++class PreparedData:
++    dataset: str
++    documents: list[dict[str, str]] = field(default_factory=list)
++    queries: list[dict[str, str]] = field(default_factory=list)
++    qrels: dict[str, dict[str, float]] = field(default_factory=dict)
++    skipped: list[dict[str, str]] = field(default_factory=list)
++    native_qrels: bool = False
++
++
++def validate_record(dataset: str, record: dict) -> str:
++    if dataset not in DATASET_INFO:
++        raise ValueError(f"Unknown dataset {dataset}; choose {tuple(DATASET_INFO)}")
++    if dataset == "vidore" and not record.get("text", record.get("markdown")):
++        raise ValueError("Vidore record needs markdown text")
++    if dataset == "parsebench" and not record.get("text_content"):
++        raise ValueError("ParseBench record needs text_content")
++    if dataset == "govdocs" and record.get("broken_pdf") is True:
++        raise ValueError("GovDocs broken_pdf=true is excluded")
++    return str(record.get("id", record.get("doc_id", "")))
++
++
++def smoke_documents() -> list[dict[str, str]]:
++    return [
++        {"id": "smoke-1", "text": "Neon stores vectors with pgvector."},
++        {"id": "smoke-2", "text": "HNSW accelerates cosine retrieval."},
++    ]
++
++
++def load_optional(name: str, max_rows: int = 1000, max_documents: int = 100):
++    """Load a bounded live sample; credentials/network are required by Hugging Face."""
++    try:
++        from datasets import load_dataset
++    except ImportError as exc:
++        raise RuntimeError("Install the full extra to load Hugging Face datasets") from exc
++    if name == "vidore":
++        components = {}
++        for component in ("corpus", "queries", "qrels"):
++            try:
++                components[component] = load_dataset(
++                    "vidore/vidore_v3_industrial", component, split="test"
++                )
++            except Exception as exc:
++                raise RuntimeError(
++                    "Vidore must expose configs corpus/queries/qrels with test splits; "
++                    f"could not load config={component}, split=test: {exc}"
++                ) from exc
++        return components
++    if name == "parsebench":
++        return load_dataset("llamaindex/ParseBench", "parse-bench", split=f"train[:{max_rows}]")
++    if name == "govdocs":
++        # GovDocs provides source PDFs/metadata rather than extracted text; callers must extract text.
++        return load_dataset("BEE-spoke-data/govdocs1-pdf-source", split=f"train[:{max_documents}]")
++    raise ValueError(f"Unknown dataset {name}; choose {tuple(DATASET_INFO)}")
++
++
++def load_query_source(path: str) -> tuple[list[dict[str, str]], dict[str, dict[str, float]]]:
++    """Read query_id/text and optional reference_answer/qrels from JSONL or CSV."""
++    source = Path(path)
++    if not source.is_file():
++        raise FileNotFoundError(f"QUERY_SOURCE does not exist: {path}")
++    if source.suffix.lower() == ".csv":
++        rows = list(csv.DictReader(source.open(encoding="utf-8", newline="")))
++    elif source.suffix.lower() in {".jsonl", ".ndjson", ".json"}:
++        rows = [
++            json.loads(line)
++            for line in source.read_text(encoding="utf-8").splitlines()
++            if line.strip()
++        ]
++    else:
++        raise ValueError("QUERY_SOURCE must be .jsonl, .ndjson, or .csv")
++    queries, qrels = [], {}
++    for row in rows:
++        query_id = str(row.get("query_id", "")).strip()
++        text = str(row.get("text", "")).strip()
++        if not query_id or not text:
++            raise ValueError("every query source row needs non-empty query_id and text")
++        query = {"id": query_id, "text": text}
++        if row.get("reference_answer"):
++            query["reference_answer"] = str(row["reference_answer"])
++        queries.append(query)
++        raw_qrels = row.get("qrels", row.get("relevant_doc_ids", ""))
++        if raw_qrels:
++            ids = (
++                raw_qrels
++                if isinstance(raw_qrels, list)
++                else str(raw_qrels).replace(";", ",").split(",")
++            )
++            qrels[query_id] = {str(doc_id).strip(): 1.0 for doc_id in ids if str(doc_id).strip()}
++    return queries, qrels
++
++
++def _extract_pdf(payload, extractor: str = "pypdf") -> str:
++    if extractor != "pypdf":
++        raise RuntimeError(f"unsupported GOVDOCS_PDF_EXTRACTOR={extractor}; supported: pypdf")
++    try:
++        from pypdf import PdfReader
++    except ImportError as exc:
++        raise RuntimeError("GovDocs PDF extraction requires optional dependency pypdf") from exc
++    if isinstance(payload, bytes):
++        reader = PdfReader(BytesIO(payload))
++    elif isinstance(payload, str) and Path(payload).is_file():
++        reader = PdfReader(payload)
++    else:
++        raise ValueError("GovDocs PDF field must be bytes or a local PDF path")
++    return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
++
++
++def _rows(value):
++    if isinstance(value, dict) and "train" in value:
++        return value["train"]
++    return value
++
++
++def _get(row, *names):
++    for name in names:
++        if isinstance(row, dict) and row.get(name) is not None:
++            return row[name]
++    return None
++
++
++def prepare_records(
++    name: str,
++    raw,
++    seed: int = 7,
++    max_rows: int = 1000,
++    max_documents: int = 100,
++    max_bytes: int = 1_000_000_000,
++    query_source: str | None = None,
++    pdf_extractor: str = "pypdf",
++) -> PreparedData:
++    """Normalize a bounded HF result and record honest skips instead of inventing text/queries."""
++    if name not in DATASET_INFO:
++        raise ValueError(f"Unknown dataset {name}; choose {tuple(DATASET_INFO)}")
++    result = PreparedData(name)
++    if name == "vidore":
++        if not isinstance(raw, dict) or not all(
++            key in raw for key in ("corpus", "queries", "qrels")
++        ):
++            raise RuntimeError("Vidore loader returned no corpus/queries/qrels test components")
++        corpus = _rows(raw["corpus"])
++        queries = _rows(raw["queries"])
++        qrel_rows = _rows(raw["qrels"])
++        for row in list(corpus)[:max_rows]:
++            doc_id = str(_get(row, "corpus_id", "id", "doc_id"))
++            text = _get(row, "markdown", "text", "content")
++            if text:
++                result.documents.append({"id": doc_id, "text": str(text)})
++            else:
++                result.skipped.append({"id": doc_id, "reason": "missing markdown/text"})
++        for row in list(queries)[:max_rows]:
++            query_id = str(_get(row, "query_id", "id"))
++            text = _get(row, "query", "text")
++            if text:
++                result.queries.append({"id": query_id, "text": str(text)})
++        for row in list(qrel_rows)[:max_rows]:
++            query_id = str(_get(row, "query_id"))
++            doc_id = str(_get(row, "corpus_id"))
++            result.qrels.setdefault(query_id, {})[doc_id] = float(_get(row, "score") or 0)
++        result.native_qrels = bool(result.qrels)
++    else:
++        rows = list(_rows(raw)) if raw is not None else []
++        rng = random.Random(seed)
++        rng.shuffle(rows)
++        if name == "parsebench":
++            for row in rows[:max_rows]:
++                text = _get(row, "text_content")
++                if text:
++                    result.documents.append(
++                        {
++                            "id": str(_get(row, "id", "document_id") or len(result.documents)),
++                            "text": str(text),
++                        }
++                    )
++                else:
++                    result.skipped.append({"reason": "missing text_content"})
++            if not query_source:
++                # ParseBench has useful text but no native queries: deterministic first-sentence queries are explicit fallback.
++                for document in result.documents[: min(10, len(result.documents))]:
++                    result.queries.append(
++                        {"id": f"generated-{document['id']}", "text": document["text"][:160]}
++                    )
++                result.skipped.append(
++                    {"reason": "no native qrels; generated deterministic queries"}
++                )
++        else:
++            total_bytes = 0
++            for row in rows:
++                if len(result.documents) >= max_documents:
++                    break
++                if _get(row, "broken_pdf") is True:
++                    result.skipped.append({"reason": "broken_pdf=true"})
++                    continue
++                payload = _get(row, "text", "content")
++                if not payload:
++                    try:
++                        payload = _extract_pdf(_get(row, "pdf", "pdf_bytes"), pdf_extractor)
++                    except (RuntimeError, ValueError) as exc:
++                        result.skipped.append(
++                            {"id": str(_get(row, "id", "doc_id")), "reason": str(exc)}
++                        )
++                        continue
++                if not isinstance(payload, str) or not payload.strip():
++                    result.skipped.append({"reason": "PDF extraction produced no text"})
++                    continue
++                if total_bytes + len(payload.encode()) > max_bytes:
++                    result.skipped.append({"reason": "max_bytes reached"})
++                    break
++                total_bytes += len(payload.encode())
++                doc_id = str(_get(row, "id", "doc_id") or len(result.documents))
++                result.documents.append({"id": doc_id, "text": payload})
++            if not query_source:
++                for document in result.documents[: min(10, len(result.documents))]:
++                    result.queries.append(
++                        {"id": f"generated-{document['id']}", "text": document["text"][:160]}
++                    )
++                result.skipped.append(
++                    {"reason": "no native qrels; generated deterministic queries"}
++                )
++    if query_source:
++        result.queries, source_qrels = load_query_source(query_source)
++        result.qrels.update(source_qrels)
++        result.skipped.append({"reason": f"queries loaded from {query_source}"})
++    return result
+diff --git a/neon_rag_benchmarks/db.py b/neon_rag_benchmarks/db.py
+new file mode 100644
+index 0000000..1f3400d
+--- /dev/null
++++ b/neon_rag_benchmarks/db.py
+@@ -0,0 +1,89 @@
++"""Optional Neon/pgvector persistence."""
++
++from .schema import create_schema_sql, search_sql
++from .schema import validate_vectors
++
++
++def connect(database_url: str):
++    try:
++        import psycopg
++    except ImportError as exc:
++        raise RuntimeError("Install the full extra for Neon") from exc
++    connection = psycopg.connect(database_url)
++    try:
++        with connection.cursor() as cur:
++            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
++        connection.commit()
++        from pgvector.psycopg import register_vector
++
++        register_vector(connection)
++    except ImportError as exc:
++        connection.close()
++        raise RuntimeError("Install pgvector to register vector parameters with psycopg") from exc
++    except Exception:
++        connection.rollback()
++        connection.close()
++        raise
++    return connection
++
++
++def setup(
++    connection, dimension: int, m: int, ef_construction: int, table: str = "rag_chunks"
++) -> None:
++    with connection.cursor() as cur:
++        for statement in create_schema_sql(
++            dimension, table=table, m=m, ef_construction=ef_construction
++        ):
++            cur.execute(statement)
++    connection.commit()
++
++
++def clear_dataset(connection, dataset: str, table: str = "rag_chunks") -> None:
++    if not table.replace("_", "").isalnum():
++        raise ValueError("invalid table")
++    with connection.cursor() as cur:
++        cur.execute(f"DELETE FROM {table} WHERE dataset = %s", (dataset,))
++    connection.commit()
++
++
++def insert_chunks(
++    connection,
++    dataset: str,
++    chunks: list[tuple[str, str]],
++    vectors: list[list[float]],
++    table: str = "rag_chunks",
++    dimension: int | None = None,
++) -> None:
++    if not table.replace("_", "").isalnum():
++        raise ValueError("invalid table")
++    if len(chunks) != len(vectors):
++        raise ValueError(f"chunks/vectors length mismatch: {len(chunks)} != {len(vectors)}")
++    if dimension is not None:
++        validate_vectors(vectors, dimension)
++    with connection.cursor() as cur:
++        cur.executemany(
++            f"INSERT INTO {table} (dataset, doc_id, content, embedding) VALUES (%s, %s, %s, %s)",
++            [(dataset, doc_id, text, vector) for (doc_id, text), vector in zip(chunks, vectors)],
++        )
++    connection.commit()
++
++
++def search(
++    connection, vector: list[float], dataset: str, k: int, ef_search: int, table: str = "rag_chunks"
++):
++    with connection.cursor() as cur:
++        if ef_search < 1:
++            raise ValueError("ef_search must be >= 1")
++        # SET does not accept bind parameters; this value is validated as an integer first.
++        cur.execute(f"SET LOCAL hnsw.ef_search = {int(ef_search)}")
++        cur.execute(search_sql(table), (vector, dataset, vector, k))
++        return cur.fetchall()
++
++
++def exact_search(connection, vector: list[float], dataset: str, k: int, table: str = "rag_chunks"):
++    with connection.cursor() as cur:
++        # Force PostgreSQL's exact scan for a fair baseline instead of allowing HNSW.
++        cur.execute("SET LOCAL enable_indexscan = off")
++        cur.execute("SET LOCAL enable_bitmapscan = off")
++        cur.execute(search_sql(table), (vector, dataset, vector, k))
++        return cur.fetchall()
+diff --git a/neon_rag_benchmarks/embeddings.py b/neon_rag_benchmarks/embeddings.py
+new file mode 100644
+index 0000000..08848fc
+--- /dev/null
++++ b/neon_rag_benchmarks/embeddings.py
+@@ -0,0 +1,48 @@
++"""Local sentence-transformers embedding generation."""
++
++from functools import lru_cache
++
++
++@lru_cache(maxsize=3)
++def _model(model_key: str):
++    from .config import MODELS
++
++    try:
++        from sentence_transformers import SentenceTransformer
++    except ImportError as exc:
++        raise RuntimeError("Install the full extra for local embeddings") from exc
++    name, _ = MODELS[model_key]
++    return SentenceTransformer(name, trust_remote_code=model_key == "nomic")
++
++
++def embed_texts(texts: list[str], model_key: str, batch_size: int = 32) -> list[list[float]]:
++    from .config import MODELS
++
++    if model_key not in MODELS:
++        raise ValueError(f"Unknown embedding model: {model_key}")
++    name, dimension = MODELS[model_key]
++    del name
++    model = _model(model_key)
++    prefix = "search_document: " if model_key == "nomic" else ""
++    result = model.encode(
++        [prefix + text for text in texts], batch_size=batch_size, normalize_embeddings=True
++    ).tolist()
++    if result and len(result[0]) != dimension:
++        raise RuntimeError(f"Embedding dimension mismatch: expected {dimension}")
++    return result
++
++
++def embed_query(query: str, model_key: str) -> list[float]:
++    """Embed one query using the model's retrieval instruction."""
++    from .config import MODELS
++
++    if model_key not in MODELS:
++        raise ValueError(f"Unknown embedding model: {model_key}")
++    name, dimension = MODELS[model_key]
++    del name
++    model = _model(model_key)
++    prefix = "search_query: " if model_key == "nomic" else ""
++    vector = model.encode([prefix + query], normalize_embeddings=True)[0].tolist()
++    if len(vector) != dimension:
++        raise RuntimeError(f"Embedding dimension mismatch: expected {dimension}")
++    return vector
+diff --git a/neon_rag_benchmarks/gateway.py b/neon_rag_benchmarks/gateway.py
+new file mode 100644
+index 0000000..270b561
+--- /dev/null
++++ b/neon_rag_benchmarks/gateway.py
+@@ -0,0 +1,13 @@
++"""OpenAI-compatible Databricks AI Gateway chat calls."""
++
++
++def answer(question: str, context: str, endpoint: str, base_url: str, token: str) -> str:
++    try:
++        from openai import OpenAI
++    except ImportError as exc:
++        raise RuntimeError("Install the full extra for Databricks answers") from exc
++    response = OpenAI(base_url=base_url, api_key=token).chat.completions.create(
++        model=endpoint,
++        messages=[{"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}],
++    )
++    return response.choices[0].message.content or ""
+diff --git a/neon_rag_benchmarks/matrix.py b/neon_rag_benchmarks/matrix.py
+new file mode 100644
+index 0000000..957c2aa
+--- /dev/null
++++ b/neon_rag_benchmarks/matrix.py
+@@ -0,0 +1,16 @@
++"""Matrix definitions and credential-free planning."""
++
++from itertools import product
++from .config import DATASETS, MODELS
++
++
++def matrix() -> list[dict[str, str]]:
++    endpoints = (
++        "DATABRICKS_CHAT_ENDPOINT_1",
++        "DATABRICKS_CHAT_ENDPOINT_2",
++        "DATABRICKS_CHAT_ENDPOINT_3",
++    )
++    return [
++        {"dataset": dataset, "embedding_model": model, "chat_endpoint_env": endpoint}
++        for dataset, model, endpoint in product(DATASETS, MODELS, endpoints)
++    ]
+diff --git a/neon_rag_benchmarks/metrics.py b/neon_rag_benchmarks/metrics.py
+new file mode 100644
+index 0000000..9e1f66c
+--- /dev/null
++++ b/neon_rag_benchmarks/metrics.py
+@@ -0,0 +1,62 @@
++"""Pure retrieval and timing metrics."""
++
++from dataclasses import dataclass
++import math
++import re
++
++
++@dataclass(frozen=True)
++class Timing:
++    embedding_seconds: float = 0.0
++    ingest_seconds: float = 0.0
++    search_seconds: float = 0.0
++    answer_seconds: float = 0.0
++
++
++def normalized_text(value: str) -> str:
++    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", value.lower())).strip()
++
++
++def answer_metrics(generated: str, status: str, reference: str | None = None) -> dict:
++    result = {
++        "status": status,
++        "answer_chars": len(generated),
++        "answer_words": len(generated.split()),
++        "quality_metric_support": "reference_match_only; no truth judgment",
++    }
++    if reference is not None:
++        result["normalized_exact_match"] = normalized_text(generated) == normalized_text(reference)
++    else:
++        result["normalized_exact_match"] = None
++        result["quality_metric_note"] = "unsupported_without_reference_answer"
++    return result
++
++
++def recall_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
++    if not relevant:
++        return float("nan")
++    return len(set(retrieved[:k]) & relevant) / len(relevant)
++
++
++def mrr_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
++    for rank, doc_id in enumerate(retrieved[:k], 1):
++        if doc_id in relevant:
++            return 1.0 / rank
++    return 0.0
++
++
++def cosine_similarity(a: list[float], b: list[float]) -> float:
++    if len(a) != len(b) or not a:
++        raise ValueError("vectors must have equal non-zero dimensions")
++    denom = math.sqrt(sum(x * x for x in a) * sum(x * x for x in b))
++    return sum(x * y for x, y in zip(a, b)) / denom if denom else 0.0
++
++
++def exact_cosine_search(
++    query: list[float], documents: list[tuple[str, list[float]]], k: int
++) -> list[tuple[str, float]]:
++    """Exact cosine baseline for small runs, without a database or approximate index."""
++    if k < 1:
++        raise ValueError("k must be >= 1")
++    scored = [(doc_id, cosine_similarity(query, vector)) for doc_id, vector in documents]
++    return sorted(scored, key=lambda item: item[1], reverse=True)[:k]
+diff --git a/neon_rag_benchmarks/pipeline.py b/neon_rag_benchmarks/pipeline.py
+new file mode 100644
+index 0000000..6c1e0ba
+--- /dev/null
++++ b/neon_rag_benchmarks/pipeline.py
+@@ -0,0 +1,248 @@
++"""End-to-end bounded benchmark orchestration for live and offline runs."""
++
++import json
++from pathlib import Path
++from time import perf_counter
++
++from . import db
++from .config import BenchmarkConfig, MODELS
++from .datasets import PreparedData, load_optional, prepare_records, smoke_documents
++from .embeddings import embed_query, embed_texts
++from .gateway import answer
++from .metrics import answer_metrics, exact_cosine_search, mrr_at_k, recall_at_k
++from .schema import validate_vectors
++
++
++def chunk_text(text: str, size: int = 800, overlap: int = 80) -> list[str]:
++    if size < 1 or overlap < 0 or overlap >= size:
++        raise ValueError("chunk size must be positive and overlap must be smaller than size")
++    return [text[start : start + size] for start in range(0, len(text), size - overlap)] or [""]
++
++
++def _synthetic_vector(text: str, dimension: int = 8) -> list[float]:
++    values = [0.0] * dimension
++    for index, char in enumerate(text.encode("utf-8")):
++        values[index % dimension] += (char % 31) / 31
++    return values
++
++
++def _document_id(chunk_id: str) -> str:
++    return chunk_id.split("#chunk-", 1)[0]
++
++
++def _persist(path: str, records: list[dict]) -> None:
++    destination = Path(path)
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    with destination.open("a", encoding="utf-8") as stream:
++        for record in records:
++            stream.write(json.dumps(record, sort_keys=True) + "\n")
++
++
++def _endpoint_specs(config: BenchmarkConfig):
++    return tuple(
++        (f"DATABRICKS_CHAT_ENDPOINT_{i}", endpoint)
++        for i, endpoint in enumerate(config.chat_endpoints, 1)
++    )
++
++
++def _skip_records(
++    data: PreparedData, model_key: str, config: BenchmarkConfig, reason: str
++) -> list[dict]:
++    return [
++        {
++            "dataset": data.dataset,
++            "embedding_model": model_key,
++            "chat_endpoint_env": env_name,
++            "chat_endpoint": endpoint,
++            "status": "skipped",
++            "reason": reason,
++            "skipped": data.skipped,
++        }
++        for env_name, endpoint in _endpoint_specs(config)
++    ]
++
++
++def run_benchmark(
++    config: BenchmarkConfig,
++    data: PreparedData,
++    model_key: str,
++    smoke: bool = False,
++    persist: bool = True,
++) -> list[dict]:
++    """Run one dataset/model and emit one result per configured endpoint."""
++    if model_key not in MODELS:
++        raise ValueError(f"Unknown embedding model {model_key}")
++    if not data.documents:
++        records = _skip_records(data, model_key, config, "no documents after validation")
++        if persist:
++            _persist(config.results_path, records)
++        return records
++    started = perf_counter()
++    chunks = [
++        (doc["id"] + f"#chunk-{i}", chunk)
++        for doc in data.documents
++        for i, chunk in enumerate(chunk_text(doc["text"], config.chunk_size, config.chunk_overlap))
++    ]
++    embedding_started = perf_counter()
++    vectors = (
++        [_synthetic_vector(text) for _, text in chunks]
++        if smoke
++        else embed_texts([text for _, text in chunks], model_key)
++    )
++    embedding_seconds = perf_counter() - embedding_started
++    expected_dimension = 8 if smoke else MODELS[model_key][1]
++    validate_vectors(vectors, expected_dimension)
++    connection = None
++    table = f"rag_chunks_{model_key}"
++    ingest_started = perf_counter()
++    if not smoke:
++        connection = db.connect(config.require_database())
++        db.setup(connection, expected_dimension, config.hnsw_m, config.hnsw_ef_construction, table)
++        db.clear_dataset(connection, data.dataset, table)
++        db.insert_chunks(connection, data.dataset, chunks, vectors, table, expected_dimension)
++    ingest_seconds = perf_counter() - ingest_started
++    queries = data.queries or (
++        [{"id": "smoke-query", "text": "How does vector retrieval work?"}] if smoke else []
++    )
++    if not queries:
++        records = _skip_records(
++            data, model_key, config, "no queries supplied; provide QUERY_SOURCE for this dataset"
++        )
++        if connection:
++            connection.close()
++        if persist:
++            _persist(config.results_path, records)
++        return records
++    records = []
++    for query in queries:
++        query_embedding_started = perf_counter()
++        query_vector = (
++            _synthetic_vector(query["text"]) if smoke else embed_query(query["text"], model_key)
++        )
++        query_embedding_seconds = perf_counter() - query_embedding_started
++        if smoke:
++            ranked = exact_cosine_search(
++                query_vector, list(zip([doc_id for doc_id, _ in chunks], vectors)), config.top_k
++            )
++            hnsw_ids = [item[0] for item in ranked]
++            hnsw_scores = [item[1] for item in ranked]
++            exact_ids = hnsw_ids
++            hnsw_seconds = query_embedding_seconds
++            exact_seconds = 0.0
++        else:
++            hnsw_started = perf_counter()
++            hnsw_rows = db.search(
++                connection, query_vector, data.dataset, config.top_k, config.hnsw_ef_search, table
++            )
++            hnsw_seconds = perf_counter() - hnsw_started
++            hnsw_ids = [row[0] for row in hnsw_rows]
++            hnsw_scores = [float(row[2]) for row in hnsw_rows]
++            exact_started = perf_counter()
++            exact_rows = db.exact_search(
++                connection, query_vector, data.dataset, config.top_k, table
++            )
++            exact_seconds = perf_counter() - exact_started
++            exact_ids = [row[0] for row in exact_rows]
++        relevant = {
++            doc
++            for doc, score in data.qrels.get(query["id"], {}).items()
++            if score >= config.qrel_min_score
++        }
++        hnsw_eval_ids = [_document_id(doc_id) for doc_id in hnsw_ids]
++        exact_eval_ids = [_document_id(doc_id) for doc_id in exact_ids]
++        retrieval_metrics = None
++        if relevant:
++            retrieval_metrics = {
++                "hnsw_recall@k": recall_at_k(hnsw_eval_ids, relevant, config.top_k),
++                "hnsw_mrr@k": mrr_at_k(hnsw_eval_ids, relevant, config.top_k),
++                "exact_recall@k": recall_at_k(exact_eval_ids, relevant, config.top_k),
++            }
++        context = "\n\n".join(text for doc_id, text in chunks if doc_id in hnsw_ids)
++        for endpoint_env, endpoint in _endpoint_specs(config):
++            record = {
++                "dataset": data.dataset,
++                "embedding_model": model_key,
++                "chat_endpoint_env": endpoint_env,
++                "chat_endpoint": endpoint,
++                "query_id": query["id"],
++                "status": "ok",
++                "retrieval": {
++                    "hnsw_top_ids": hnsw_ids,
++                    "hnsw_scores": hnsw_scores,
++                    "exact_top_ids": exact_ids,
++                },
++                "timing_seconds": {
++                    "embedding": embedding_seconds + query_embedding_seconds,
++                    "ingest": ingest_seconds,
++                    "hnsw_search": hnsw_seconds,
++                    "exact_scan": exact_seconds,
++                    "total": perf_counter() - started,
++                },
++                "qrel_threshold": config.qrel_min_score,
++                "native_qrels": data.native_qrels,
++                "retrieval_metrics": retrieval_metrics,
++            }
++            if not endpoint or not config.gateway_base_url or not config.gateway_token:
++                record["answer_metrics"] = answer_metrics(
++                    "", "skipped", query.get("reference_answer")
++                )
++                record["answer_metrics"]["reason"] = (
++                    "gateway endpoint, base URL, or token not configured"
++                )
++            else:
++                answer_started = perf_counter()
++                try:
++                    generated = answer(
++                        query["text"],
++                        context,
++                        endpoint,
++                        config.gateway_base_url,
++                        config.gateway_token,
++                    )
++                    record["answer_metrics"] = answer_metrics(
++                        generated, "ok", query.get("reference_answer")
++                    )
++                except Exception as exc:
++                    record["answer_metrics"] = answer_metrics(
++                        "", "error", query.get("reference_answer")
++                    )
++                    record["answer_metrics"]["reason"] = str(exc)
++                record["timing_seconds"]["answer"] = perf_counter() - answer_started
++            records.append(record)
++    if connection:
++        connection.close()
++    if persist:
++        _persist(config.results_path, records)
++    return records
++
++
++def run_matrix(config: BenchmarkConfig, smoke: bool = False, persist: bool = True) -> list[dict]:
++    """Execute all 27 dataset/model/endpoint combinations."""
++    if not smoke:
++        config.require_gateway()
++    output = []
++    for dataset_name in ("vidore", "parsebench", "govdocs"):
++        if smoke:
++            data = PreparedData(
++                dataset_name,
++                documents=smoke_documents(),
++                queries=[{"id": "smoke-query", "text": "How does vector retrieval work?"}],
++                qrels={"smoke-query": {"smoke-1": 1.0}},
++            )
++        else:
++            raw = load_optional(
++                dataset_name, config.parsebench_max_rows, config.govdocs_max_documents
++            )
++            data = prepare_records(
++                dataset_name,
++                raw,
++                config.seed,
++                config.parsebench_max_rows,
++                config.govdocs_max_documents,
++                config.govdocs_max_bytes,
++                config.query_source,
++                config.govdocs_pdf_extractor,
++            )
++        for model_key in MODELS:
++            output.extend(run_benchmark(config, data, model_key, smoke=smoke, persist=persist))
++    return output
+diff --git a/neon_rag_benchmarks/schema.py b/neon_rag_benchmarks/schema.py
+new file mode 100644
+index 0000000..75df20a
+--- /dev/null
++++ b/neon_rag_benchmarks/schema.py
+@@ -0,0 +1,41 @@
++"""Dimension-safe pgvector schema and SQL helpers."""
++
++
++def validate_dimension(model_key: str, dimension: int) -> None:
++    from .config import MODELS
++
++    if model_key not in MODELS:
++        raise ValueError(f"Unknown embedding model: {model_key}")
++    expected = MODELS[model_key][1]
++    if dimension != expected:
++        raise ValueError(f"{model_key} produces {expected} dimensions, got {dimension}")
++
++
++def validate_vectors(vectors: list[list[float]], expected_dimension: int) -> None:
++    if not vectors:
++        raise ValueError("cannot insert an empty vector batch")
++    for index, vector in enumerate(vectors):
++        if len(vector) != expected_dimension:
++            raise ValueError(
++                f"vector {index} has dimension {len(vector)}; expected {expected_dimension}"
++            )
++
++
++def create_schema_sql(
++    dimension: int, table: str = "rag_chunks", m: int = 16, ef_construction: int = 128
++) -> tuple[str, ...]:
++    if dimension < 1 or not table.replace("_", "").isalnum():
++        raise ValueError("invalid schema arguments")
++    if m < 2 or ef_construction < 1:
++        raise ValueError("HNSW parameters are invalid")
++    return (
++        "CREATE EXTENSION IF NOT EXISTS vector",
++        f"CREATE TABLE IF NOT EXISTS {table} (id BIGSERIAL PRIMARY KEY, dataset TEXT NOT NULL, doc_id TEXT NOT NULL, content TEXT NOT NULL, embedding vector({dimension}) NOT NULL)",
++        f"CREATE INDEX IF NOT EXISTS {table}_embedding_hnsw ON {table} USING hnsw (embedding vector_cosine_ops) WITH (m = {m}, ef_construction = {ef_construction})",
++    )
++
++
++def search_sql(table: str = "rag_chunks") -> str:
++    if not table.replace("_", "").isalnum():
++        raise ValueError("invalid table")
++    return f"SELECT doc_id, content, 1 - (embedding <=> %s) AS score FROM {table} WHERE dataset = %s ORDER BY embedding <=> %s LIMIT %s"
+diff --git a/neon_rag_benchmarks/smoke.py b/neon_rag_benchmarks/smoke.py
+new file mode 100644
+index 0000000..89d5e69
+--- /dev/null
++++ b/neon_rag_benchmarks/smoke.py
+@@ -0,0 +1,24 @@
++"""Credential-free deterministic smoke benchmark."""
++
++from .datasets import smoke_documents
++from .metrics import cosine_similarity, mrr_at_k, recall_at_k
++
++
++def run_smoke() -> dict[str, float | bool | str]:
++    docs = smoke_documents()
++    vectors = [[1.0, 0.0], [0.0, 1.0]]
++    q = [0.8, 0.2]
++    ranked = [
++        doc["id"]
++        for _, doc in sorted(zip([cosine_similarity(q, v) for v in vectors], docs), reverse=True)
++    ]
++    return {
++        "offline": True,
++        "top_doc": ranked[0],
++        "recall@1": recall_at_k(ranked, {"smoke-1"}, 1),
++        "mrr@2": mrr_at_k(ranked, {"smoke-1"}, 2),
++    }
++
++
++if __name__ == "__main__":
++    print(run_smoke())
+diff --git a/notebooks/benchmark_matrix.ipynb b/notebooks/benchmark_matrix.ipynb
+new file mode 100644
+index 0000000..5040e19
+--- /dev/null
++++ b/notebooks/benchmark_matrix.ipynb
+@@ -0,0 +1,10 @@
++{
++ "cells": [
++  {"cell_type":"markdown","id":"intro","metadata":{},"source":["# Neon RAG benchmark matrix\n","\n","This notebook plans and runs the 27 combinations. Full ingestion is opt-in: Vidore has native qrels; ParseBench and GovDocs require supplied/generated queries. The first cell is a deterministic offline smoke path."]},
++  {"cell_type":"code","execution_count":null,"id":"controls","metadata":{},"outputs":[],"source":["from neon_rag_benchmarks.config import BenchmarkConfig, MODELS\n","from neon_rag_benchmarks.matrix import matrix\n","from neon_rag_benchmarks.pipeline import run_matrix\n","\n","# Parameter controls: set SMOKE=False for bounded live HF + Neon + gateway execution.\n","config = BenchmarkConfig.from_env()\n","SMOKE = True\n","DATASET = 'vidore'\n","EMBEDDING_MODEL = 'minilm'\n","TOP_K = 10\n","EXACT_SCAN = True  # compare exact cosine on small runs\n","print(MODELS[EMBEDDING_MODEL], DATASET, TOP_K, EXACT_SCAN)"]},
++  {"cell_type":"code","execution_count":null,"id":"run","metadata":{},"outputs":[],"source":["# This is the executable workflow for both modes; live mode validates gateway config first.\n","results = run_matrix(config, smoke=SMOKE, persist=False)\n","print(f'{len(matrix())} matrix combinations; {len(results)} endpoint records')\n","print(results[0])"]},
++  {"cell_type":"markdown","id":"live-contract","metadata":{},"source":["## Live execution contract\n","\n","Use `neon_rag_benchmarks.embeddings.embed_texts`/`embed_query`, `db.setup`/`db.search`, and `gateway.answer`. Time each phase. For Vidore load corpus/test markdown, queries/test query, and qrels/test query_id/corpus_id/score. ParseBench uses `text_content` and GovDocs needs PDF text extraction plus `broken_pdf=false`; both need user-provided or generated queries. Answer results must retain the endpoint environment variable label."]}
++ ],
++ "metadata":{"kernelspec":{"display_name":"Python 3","language":"python","name":"python3"},"language_info":{"name":"python","version":"3.11"}},
++ "nbformat":4,"nbformat_minor":5
++}
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..e923939
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,22 @@
++[build-system]
++requires = ["setuptools>=68"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "neon-rag-benchmarks"
++version = "0.1.0"
++description = "Reproducible Neon + pgvector HNSW RAG retrieval benchmarks"
++requires-python = ">=3.11,<3.12"
++dependencies = ["numpy==1.26.4", "python-dotenv==1.0.1"]
++
++[project.optional-dependencies]
++full = ["datasets==2.21.0", "openai==1.51.0", "pgvector==0.3.6", "psycopg[binary]==3.2.3", "pypdf==5.1.0", "sentence-transformers==3.2.1", "jupyter==1.1.1", "nbformat==5.10.4", "nbclient==0.10.0"]
++dev = ["pytest==8.3.3", "ruff==0.6.9", "nbformat==5.10.4"]
++
++[tool.setuptools.packages.find]
++include = ["neon_rag_benchmarks*"]
++[tool.ruff]
++line-length = 100
++target-version = "py311"
++[tool.pytest.ini_options]
++testpaths = ["tests"]
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000..2f66a2c
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1 @@
++-e .[full,dev]
+diff --git a/tests/test_core.py b/tests/test_core.py
+new file mode 100644
+index 0000000..d08393e
+--- /dev/null
++++ b/tests/test_core.py
+@@ -0,0 +1,71 @@
++import math
++import pytest
++from neon_rag_benchmarks.config import BenchmarkConfig, MODELS
++from neon_rag_benchmarks import db
++from neon_rag_benchmarks.datasets import prepare_records, validate_record
++from neon_rag_benchmarks.metrics import answer_metrics, exact_cosine_search, mrr_at_k, recall_at_k
++from neon_rag_benchmarks.pipeline import chunk_text, run_matrix
++from neon_rag_benchmarks.schema import create_schema_sql, validate_dimension, validate_vectors
++from neon_rag_benchmarks.smoke import run_smoke
++
++
++def test_config_and_model_dimensions():
++    c = BenchmarkConfig.from_env({"HNSW_M": "20"})
++    assert c.hnsw_m == 20
++    assert MODELS["nomic"][1] == 768
++
++
++def test_schema_is_dimension_safe():
++    validate_dimension("minilm", 384)
++    assert "vector(384)" in create_schema_sql(384)[1]
++    with pytest.raises(ValueError):
++        validate_dimension("minilm", 768)
++
++
++def test_metrics():
++    assert recall_at_k(["a", "b"], {"b"}, 2) == 1
++    assert mrr_at_k(["a", "b"], {"b"}, 2) == 0.5
++    assert math.isnan(recall_at_k([], set(), 1))
++    assert exact_cosine_search([1, 0], [("a", [1, 0]), ("b", [0, 1])], 1) == [("a", 1.0)]
++
++
++def test_dataset_validation():
++    assert validate_record("vidore", {"id": "x", "markdown": "hello"}) == "x"
++    with pytest.raises(ValueError):
++        validate_record("govdocs", {"id": "x", "broken_pdf": True})
++
++
++def test_offline_smoke():
++    result = run_smoke()
++    assert result["offline"] is True and result["recall@1"] == 1.0
++
++
++def test_offline_matrix_executes_all_dataset_model_paths(tmp_path):
++    config = BenchmarkConfig.from_env({"RESULTS_PATH": str(tmp_path / "results.jsonl")})
++    results = run_matrix(config, smoke=True, persist=True)
++    assert len(results) == 27
++    assert all(row["status"] == "ok" for row in results)
++    assert results[0]["retrieval_metrics"]["hnsw_recall@k"] == 1.0
++    assert len((tmp_path / "results.jsonl").read_text().splitlines()) == 27
++
++
++def test_chunking_is_bounded():
++    assert chunk_text("abcdefgh", size=4, overlap=1) == ["abcd", "defg", "gh"]
++
++
++def test_vector_and_answer_validation(tmp_path):
++    with pytest.raises(ValueError):
++        validate_vectors([[1.0]], 2)
++    result = answer_metrics("A correct answer!", "ok", "a correct answer")
++    assert result["normalized_exact_match"] is True
++    source = tmp_path / "queries.jsonl"
++    source.write_text('{"query_id":"q1","text":"What?","relevant_doc_ids":"d1,d2"}\n')
++    data = prepare_records(
++        "parsebench", [{"id": "d1", "text_content": "text"}], query_source=str(source)
++    )
++    assert data.queries[0]["id"] == "q1" and set(data.qrels["q1"]) == {"d1", "d2"}
++
++
++def test_insert_rejects_mismatched_batches_without_database():
++    with pytest.raises(ValueError, match="length mismatch"):
++        db.insert_chunks(object(), "smoke", [("d", "text")], [], dimension=2)
