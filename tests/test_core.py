@@ -317,6 +317,45 @@ def test_non_truncated_filtered_vidore_rows_downgrade_provenance_scope():
     assert len(data.native_provenance["queries"]) == 2
 
 
+def test_retrieval_prefix_uses_effective_scopes_after_late_or_inconsistent_changes():
+    config = BenchmarkConfig.from_env({})
+    late_skipped = pipeline.PreparedData(
+        "vidore",
+        documents=[{"id": "d1", "text": "kept"}],
+        queries=[{"id": "q1", "text": "kept"}],
+        qrels={"q1": {"d1": 1.0}},
+        native_qrels=True,
+        evaluation_scope="complete",
+        evaluation_scope_detail="full_dataset",
+        provenance_scope="complete",
+        provenance_scope_detail="full_dataset",
+    )
+    late_skipped.skipped.append({"id": "late", "reason": "filtered"})
+    late_result = pipeline.run_benchmark(config, late_skipped, "minilm", smoke=True, persist=False)[
+        0
+    ]
+    assert late_result["evaluation_scope"] == "bounded"
+    assert late_result["retrieval_metrics"] is not None
+    assert "native_hnsw_recall@k" not in late_result["retrieval_metrics"]
+
+    inconsistent = pipeline.PreparedData(
+        "vidore",
+        documents=[{"id": "d1", "text": "kept"}],
+        queries=[{"id": "q1", "text": "kept"}],
+        qrels={"q1": {"d1": 1.0}},
+        native_qrels=True,
+        evaluation_scope="complete",
+        evaluation_scope_detail="bounded_sample",
+        provenance_scope="complete",
+        provenance_scope_detail="bounded_sample",
+    )
+    inconsistent_result = pipeline.run_benchmark(
+        config, inconsistent, "minilm", smoke=True, persist=False
+    )[0]
+    assert inconsistent_result["evaluation_scope"] == "bounded"
+    assert "native_hnsw_recall@k" not in inconsistent_result["retrieval_metrics"]
+
+
 def test_native_answer_fallback_normalizes_empty_raw_answers():
     assert pipeline._native_answers({"raw_answers": [], "answer": "native"}) == "native"
     assert pipeline._native_answers({"raw_answers": [""], "answer": "native"}) == "native"

@@ -72,6 +72,14 @@ def _record_scopes(data: PreparedData) -> tuple[str, str, str, str]:
             evaluation_scope, evaluation_detail = "bounded", "filtered_rows"
         if provenance_scope == "complete":
             provenance_scope, provenance_detail = "bounded", "filtered_rows"
+    if evaluation_scope == "complete" and evaluation_detail != "full_dataset":
+        evaluation_scope = "bounded" if evaluation_detail != "skipped" else "skipped"
+    if evaluation_scope == "bounded" and evaluation_detail == "full_dataset":
+        evaluation_detail = "inconsistent_scope"
+    if provenance_scope == "complete" and provenance_detail != "full_dataset":
+        provenance_scope = "bounded" if provenance_detail != "skipped" else "skipped"
+    if provenance_scope == "bounded" and provenance_detail == "full_dataset":
+        provenance_detail = "inconsistent_scope"
     return evaluation_scope, evaluation_detail, provenance_scope, provenance_detail
 
 
@@ -261,13 +269,13 @@ def _run_benchmark(
         hnsw_eval_ids = [_document_id(doc_id) for doc_id in hnsw_ids]
         exact_eval_ids = [_document_id(doc_id) for doc_id in exact_ids]
         retrieval_metrics = None
-        if relevant:
+        if relevant and evaluation_scope != "skipped":
             metric_prefix = (
                 "native"
-                if data.native_qrels and data.evaluation_scope_detail == "full_dataset"
-                else (
-                    "synthetic" if data.evaluation_scope_detail == "synthetic" else "bounded_sample"
-                )
+                if data.native_qrels
+                and evaluation_scope == "complete"
+                and evaluation_detail == "full_dataset"
+                else ("synthetic" if evaluation_detail == "synthetic" else "bounded_sample")
             )
             retrieval_metrics = {
                 f"{metric_prefix}_hnsw_recall@k": recall_at_k(
