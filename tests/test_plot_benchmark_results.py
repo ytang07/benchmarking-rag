@@ -1,6 +1,10 @@
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
+
+import pytest
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "plot_benchmark_results.py"
@@ -26,10 +30,12 @@ def test_stream_aggregate_extracts_metrics_and_preserves_unavailable_values():
         "malformed",
     ]
     groups, stats = plot.stream_aggregate([json.dumps(row) if isinstance(row, dict) else row for row in rows])
-    assert stats == {"lines": 4, "records": 3, "malformed": 1}
+    assert stats == {"lines": 4, "records": 3, "malformed": 1, "malformed_records": 0}
     group = groups[("minilm", "chat", "vidore", "bounded", "unknown", "bounded", "unknown")]
-    assert group.count == 1 and group.metrics["retrieval_quality"] == [0.5]
-    assert group.metrics["answer_correctness"] == [0.8]
+    assert group.count == 1 and group.metrics["retrieval_bounded_sample_hnsw"]["count"] == 1
+    assert group.metrics["retrieval_bounded_sample_hnsw"]["sum"] == 0.5
+    assert group.metrics["retrieval_native_hnsw"]["count"] == 0
+    assert group.metrics["answer_correctness"]["min"] == 0.8
     skipped = groups[("minilm", "unknown", "unknown", "skipped", "unknown", "unknown", "unknown")]
     assert skipped.skipped == 1
 
@@ -41,3 +47,44 @@ def test_summary_writes_compact_csv_and_json(tmp_path):
     summary = json.loads((tmp_path / "benchmark_summary.json").read_text())
     assert summary["input_stats"]["records"] == 1
     assert summary["groups"][0]["latency_total_mean"] == ""
+
+
+def test_unexpected_metric_containers_are_unavailable_and_non_fatal():
+    groups, stats = plot.stream_aggregate([
+        json.dumps({"embedding_model": "m", "retrieval_metrics": ["bad"], "status": "ok"}),
+        json.dumps({"embedding_model": "m", "answer_metrics": "bad", "status": "ok"}),
+    ])
+    assert stats["records"] == 2 and stats["malformed_records"] == 2
+    accumulator = next(iter(groups.values()))
+    assert accumulator.skipped == 2
+    assert accumulator.metrics["answer_correctness"]["count"] == 0
+
+
+def test_cli_writes_expected_outputs_for_explicit_paths(tmp_path):
+    pytest.importorskip("matplotlib")
+    input_path = tmp_path / "input.jsonl"
+    output_dir = tmp_path / "nested" / "plots"
+    input_path.write_text(json.dumps({
+        "embedding_model": "minilm", "evaluation_scope": "bounded",
+        "evaluation_scope_detail": "bounded_sample", "provenance_scope": "bounded",
+        "provenance_scope_detail": "bounded_sample", "status": "ok",
+        "retrieval_metrics": {"bounded_sample_exact_recall@k": 0.75},
+        "answer_metrics": {"correctness": {"value": 0.5}},
+        "timing_seconds": {"total": 1.0},
+    }) + "\n", encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--input", str(input_path), "--output-dir", str(output_dir)],
+        check=True, capture_output=True, text=True,
+    )
+    assert '"records": 1' in result.stdout
+    expected = {
+        "benchmark_summary.csv", "benchmark_summary.json", "model_quality_comparison.png",
+        "retrieval_quality_comparison.png", "citation_groundedness_comparison.png",
+        "latency_breakdown.png", "quality_vs_latency_frontier.png", "retrieval_vs_answer_quality.png",
+    }
+    assert {path.name for path in output_dir.iterdir()} == expected
+    summary = json.loads((output_dir / "benchmark_summary.json").read_text())
+    row = summary["groups"][0]
+    assert row["evaluation_scope_detail"] == "bounded_sample"
+    assert row["retrieval_bounded_sample_exact_count"] == 1
+    assert row["retrieval_native_exact_count"] == 0

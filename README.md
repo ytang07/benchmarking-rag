@@ -9,7 +9,7 @@ python -m pip install -e '.[plot]'
 python scripts/plot_benchmark_results.py --input results/benchmark.jsonl --output-dir results/plots
 ```
 
-The command also accepts `notebooks/results/benchmark.jsonl`. It creates five PNG charts plus compact CSV/JSON summaries. Null or unavailable metrics are excluded from means, and one JSONL record is processed at a time without retaining answers, passages, or other nested fields.
+The command also accepts `notebooks/results/benchmark.jsonl`. It creates six PNG charts plus compact CSV/JSON summaries. Retrieval summaries and plots keep native HNSW, bounded-sample HNSW, native exact, and bounded-sample exact metrics in separate labeled fields. Null or unavailable metrics are excluded from means, and one JSONL record is processed at a time without retaining answers, passages, or other nested fields.
 
 This Python 3.11 suite benchmarks Vidore (`vidore/vidore_v3_industrial`) across local embedding models and one optional Databricks AI Gateway model. Vidore is the only runnable answer-evaluation dataset in this benchmark; other dataset adapters, if present, are not answer-evaluation support.
 

@@ -7,12 +7,13 @@ import argparse
 import csv
 import json
 import math
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
 METRIC_FIELDS = (
-    "answer_correctness", "answer_relevance", "judge_score", "retrieval_quality",
+    "answer_correctness", "answer_relevance", "judge_score",
+    "retrieval_native_hnsw", "retrieval_bounded_sample_hnsw",
+    "retrieval_native_exact", "retrieval_bounded_sample_exact",
     "citation_validity", "citation_completeness", "groundedness", "latency_total",
     "latency_embedding", "latency_ingest", "latency_search", "latency_exact_scan", "latency_answer",
 )
@@ -40,15 +41,11 @@ def _value(record: dict[str, Any], *path: str) -> Any:
 
 def extract_scalars(record: dict[str, Any]) -> dict[str, Any]:
     """Extract only bounded scalar data; unavailable metrics remain None."""
-    retrieval = record.get("retrieval_metrics") or {}
-    answer = record.get("answer_metrics") or {}
-    timing = record.get("timing_seconds") or {}
-    retrieval_quality = next(
-        (_number(retrieval.get(name)) for name in (
-            "native_hnsw_recall@k", "bounded_sample_hnsw_recall@k", "hnsw_recall@k",
-            "native_exact_recall@k", "bounded_sample_exact_recall@k",
-        ) if _number(retrieval.get(name)) is not None), None
-    )
+    containers = {name: record.get(name) for name in ("retrieval_metrics", "answer_metrics", "timing_seconds")}
+    malformed = any(value is not None and not isinstance(value, dict) for value in containers.values())
+    retrieval = containers["retrieval_metrics"] if isinstance(containers["retrieval_metrics"], dict) else {}
+    answer = containers["answer_metrics"] if isinstance(containers["answer_metrics"], dict) else {}
+    timing = containers["timing_seconds"] if isinstance(containers["timing_seconds"], dict) else {}
     return {
         "embedding_model": record.get("embedding_model") or "unknown",
         "chat_model": record.get("chat_model") or record.get("chat_model_env") or "unknown",
@@ -57,12 +54,16 @@ def extract_scalars(record: dict[str, Any]) -> dict[str, Any]:
         "evaluation_scope_detail": record.get("evaluation_scope_detail") or "unknown",
         "provenance_scope": record.get("provenance_scope") or "unknown",
         "provenance_scope_detail": record.get("provenance_scope_detail") or "unknown",
-        "skipped": str(record.get("status", "")).lower() in {"skipped", "error"}
+        "malformed": malformed,
+        "skipped": malformed or str(record.get("status", "")).lower() in {"skipped", "error"}
         or record.get("evaluation_scope") == "skipped",
         "answer_correctness": _number(_value(answer, "correctness", "value")),
         "answer_relevance": _number(_value(answer, "answer_relevance", "value")),
         "judge_score": _number(_value(record, "judge", "value")),
-        "retrieval_quality": retrieval_quality,
+        "retrieval_native_hnsw": _number(retrieval.get("native_hnsw_recall@k")),
+        "retrieval_bounded_sample_hnsw": _number(retrieval.get("bounded_sample_hnsw_recall@k")),
+        "retrieval_native_exact": _number(retrieval.get("native_exact_recall@k")),
+        "retrieval_bounded_sample_exact": _number(retrieval.get("bounded_sample_exact_recall@k")),
         "citation_validity": _number(_value(answer, "citation_validity", "value")),
         "citation_completeness": _number(_value(answer, "retrieval_passage_citation_completeness", "value")),
         "groundedness": _number(_value(answer, "groundedness", "value")),
@@ -79,20 +80,28 @@ class _Accumulator:
     def __init__(self) -> None:
         self.count = 0
         self.skipped = 0
-        self.metrics: dict[str, list[float]] = defaultdict(list)
+        self.metrics: dict[str, dict[str, float | int]] = {
+            field: {"count": 0, "sum": 0.0, "min": math.inf, "max": -math.inf}
+            for field in METRIC_FIELDS
+        }
 
     def add(self, values: dict[str, Any]) -> None:
         self.count += 1
         self.skipped += int(values["skipped"])
         for field in METRIC_FIELDS:
-            if values[field] is not None:
-                self.metrics[field].append(values[field])
+            value = values[field]
+            if value is not None:
+                stats = self.metrics[field]
+                stats["count"] += 1
+                stats["sum"] += value
+                stats["min"] = min(stats["min"], value)
+                stats["max"] = max(stats["max"], value)
 
 
 def stream_aggregate(handle: Iterable[str]) -> tuple[dict[tuple[str, ...], _Accumulator], dict[str, int]]:
     """Aggregate JSONL line by line without retaining records or nested fields."""
     groups: dict[tuple[str, ...], _Accumulator] = {}
-    stats = {"lines": 0, "records": 0, "malformed": 0}
+    stats = {"lines": 0, "records": 0, "malformed": 0, "malformed_records": 0}
     for line in handle:
         stats["lines"] += 1
         if not line.strip():
@@ -106,6 +115,7 @@ def stream_aggregate(handle: Iterable[str]) -> tuple[dict[tuple[str, ...], _Accu
             stats["malformed"] += 1
             continue
         values = extract_scalars(record)
+        stats["malformed_records"] += int(values["malformed"])
         key = tuple(str(values[field]) for field in GROUP_FIELDS)
         groups.setdefault(key, _Accumulator()).add(values)
         stats["records"] += 1
@@ -118,9 +128,11 @@ def _summary_rows(groups: dict[tuple[str, ...], _Accumulator]) -> list[dict[str,
         row: dict[str, Any] = dict(zip(GROUP_FIELDS, key))
         row.update({"records": accumulator.count, "skipped": accumulator.skipped})
         for field in METRIC_FIELDS:
-            values = accumulator.metrics[field]
-            row[f"{field}_count"] = len(values)
-            row[f"{field}_mean"] = sum(values) / len(values) if values else ""
+            stats = accumulator.metrics[field]
+            row[f"{field}_count"] = stats["count"]
+            row[f"{field}_mean"] = stats["sum"] / stats["count"] if stats["count"] else ""
+            row[f"{field}_min"] = stats["min"] if stats["count"] else ""
+            row[f"{field}_max"] = stats["max"] if stats["count"] else ""
         rows.append(row)
     return rows
 
@@ -163,16 +175,24 @@ def _plot(output_dir: Path, groups: dict[tuple[str, ...], _Accumulator]) -> None
         fig.savefig(output_dir / filename, dpi=140)
         plt.close(fig)
 
-    bars("model_quality_comparison.png", "Model quality comparison", ("answer_correctness", "answer_relevance", "retrieval_quality"))
+    bars("model_quality_comparison.png", "Answer quality comparison", ("answer_correctness", "answer_relevance", "judge_score"))
+    bars(
+        "retrieval_quality_comparison.png",
+        "Retrieval quality comparison (separate scope and algorithm)",
+        ("retrieval_native_hnsw", "retrieval_bounded_sample_hnsw", "retrieval_native_exact", "retrieval_bounded_sample_exact"),
+    )
     bars("citation_groundedness_comparison.png", "Citation and groundedness comparison", ("citation_validity", "citation_completeness", "groundedness"))
     bars("latency_breakdown.png", "Latency breakdown", ("latency_embedding", "latency_ingest", "latency_search", "latency_exact_scan", "latency_answer"))
 
-    def scatter(filename: str, x_field: str, y_field: str, title: str, xlabel: str, ylabel: str) -> None:
+    def scatter(filename: str, x_fields: tuple[str, ...], y_field: str, title: str, xlabel: str, ylabel: str) -> None:
         fig, ax = plt.subplots(figsize=(7, 5))
         for row in rows:
-            x, y = row[f"{x_field}_mean"], row[f"{y_field}_mean"]
-            if x != "" and y != "":
-                ax.scatter(float(x), float(y), label=f"{row['embedding_model']} ({row['evaluation_scope']})")
+            y = row[f"{y_field}_mean"]
+            if y != "":
+                for x_field in x_fields:
+                    x = row[f"{x_field}_mean"]
+                    if x != "":
+                        ax.scatter(float(x), float(y), label=f"{x_field} / {row['embedding_model']} ({row['evaluation_scope_detail']})")
         ax.set(title=title, xlabel=xlabel, ylabel=ylabel)
         handles, labels_for_legend = ax.get_legend_handles_labels()
         if handles:
@@ -181,8 +201,12 @@ def _plot(output_dir: Path, groups: dict[tuple[str, ...], _Accumulator]) -> None
         fig.savefig(output_dir / filename, dpi=140)
         plt.close(fig)
 
-    scatter("quality_vs_latency_frontier.png", "latency_total", "answer_correctness", "Quality vs latency", "mean total latency (seconds)", "mean answer correctness")
-    scatter("retrieval_vs_answer_quality.png", "retrieval_quality", "answer_correctness", "Retrieval vs answer quality", "mean retrieval quality", "mean answer correctness")
+    scatter("quality_vs_latency_frontier.png", ("latency_total",), "answer_correctness", "Quality vs latency", "mean total latency (seconds)", "mean answer correctness")
+    scatter(
+        "retrieval_vs_answer_quality.png",
+        ("retrieval_native_hnsw", "retrieval_bounded_sample_hnsw", "retrieval_native_exact", "retrieval_bounded_sample_exact"),
+        "answer_correctness", "Retrieval vs answer quality (labeled metrics)", "mean retrieval recall@k", "mean answer correctness",
+    )
 
 
 def main() -> int:
