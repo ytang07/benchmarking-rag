@@ -99,8 +99,8 @@ class _Accumulator:
     def __init__(self) -> None:
         self.count = 0
         self.skipped = 0
-        self.metrics: dict[str, dict[str, float | int]] = {
-            field: {"count": 0, "sum": 0.0, "min": math.inf, "max": -math.inf}
+        self.metrics: dict[str, dict[str, float | int | None]] = {
+            field: {"count": 0, "sum": 0.0, "min": math.inf, "max": -math.inf, "overflow": False}
             for field in METRIC_FIELDS
         }
 
@@ -114,7 +114,10 @@ class _Accumulator:
             if value is not None:
                 stats = self.metrics[field]
                 stats["count"] += 1
-                stats["sum"] += value
+                if stats["sum"] is not None:
+                    candidate = stats["sum"] + value
+                    stats["sum"] = candidate if math.isfinite(candidate) else None
+                    stats["overflow"] = stats["overflow"] or stats["sum"] is None
                 stats["min"] = min(stats["min"], value)
                 stats["max"] = max(stats["max"], value)
 
@@ -154,9 +157,15 @@ def _summary_rows(groups: dict[tuple[str, ...], _Accumulator]) -> list[dict[str,
         for field in METRIC_FIELDS:
             stats = accumulator.metrics[field]
             row[f"{field}_count"] = stats["count"]
-            row[f"{field}_mean"] = stats["sum"] / stats["count"] if stats["count"] else ""
+            total = stats["sum"]
+            row[f"{field}_mean"] = (
+                total / stats["count"]
+                if stats["count"] and total is not None and math.isfinite(total)
+                else ""
+            )
             row[f"{field}_min"] = stats["min"] if stats["count"] else ""
             row[f"{field}_max"] = stats["max"] if stats["count"] else ""
+            row[f"{field}_overflow"] = bool(stats["overflow"])
         rows.append(row)
     return rows
 
@@ -169,7 +178,12 @@ def write_summary(output_dir: Path, groups: dict[tuple[str, ...], _Accumulator],
         writer.writeheader()
         writer.writerows(rows)
     (output_dir / "benchmark_summary.json").write_text(
-        json.dumps({"input_stats": stats, "groups": rows, "fields_used": list(METRIC_FIELDS)}, indent=2) + "\n",
+        json.dumps(
+            {"input_stats": stats, "groups": rows, "fields_used": list(METRIC_FIELDS)},
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -183,7 +197,11 @@ def _plot(output_dir: Path, groups: dict[tuple[str, ...], _Accumulator]) -> None
     labels = [f"{r['embedding_model']}\n{r['evaluation_scope']}" for r in rows]
 
     def means(field: str) -> list[float]:
-        return [float(r[f"{field}_mean"]) if r[f"{field}_mean"] != "" else math.nan for r in rows]
+        result = []
+        for row in rows:
+            value = row[f"{field}_mean"]
+            result.append(float(value) if value != "" and math.isfinite(float(value)) else math.nan)
+        return result
 
     def bars(filename: str, title: str, fields: tuple[str, ...]) -> None:
         fig, ax = plt.subplots(figsize=(max(7, len(labels) * 1.3), 4.5))
@@ -215,7 +233,7 @@ def _plot(output_dir: Path, groups: dict[tuple[str, ...], _Accumulator]) -> None
             if y != "":
                 for x_field in x_fields:
                     x = row[f"{x_field}_mean"]
-                    if x != "":
+                    if x != "" and math.isfinite(float(x)) and math.isfinite(float(y)):
                         ax.scatter(float(x), float(y), label=f"{x_field} / {row['embedding_model']} ({row['evaluation_scope_detail']})")
         ax.set(title=title, xlabel=xlabel, ylabel=ylabel)
         handles, labels_for_legend = ax.get_legend_handles_labels()

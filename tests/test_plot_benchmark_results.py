@@ -70,9 +70,25 @@ def test_skipped_metrics_do_not_enter_summary_statistics():
     groups, stats = plot.stream_aggregate(rows)
     accumulator = next(iter(groups.values()))
     assert stats["records"] == 2 and accumulator.skipped == 1
-    assert accumulator.metrics["latency_total"] == {"count": 1, "sum": 2.0, "min": 2.0, "max": 2.0}
+    assert accumulator.metrics["latency_total"] == {
+        "count": 1, "sum": 2.0, "min": 2.0, "max": 2.0, "overflow": False,
+    }
     assert accumulator.metrics["answer_correctness"]["count"] == 1
     assert accumulator.metrics["answer_correctness"]["sum"] == 0.4
+
+
+def test_aggregate_sum_overflow_is_marked_unavailable_and_json_safe(tmp_path):
+    rows = [json.dumps({"embedding_model": "m", "status": "ok", "timing_seconds": {"total": 1e308}})] * 2
+    groups, stats = plot.stream_aggregate(rows)
+    accumulator = next(iter(groups.values()))
+    metric = accumulator.metrics["latency_total"]
+    assert metric["count"] == 2 and metric["overflow"] is True and metric["sum"] is None
+    summary = plot._summary_rows(groups)[0]
+    assert summary["latency_total_mean"] == ""
+    plot.write_summary(tmp_path, groups, stats)
+    serialized = (tmp_path / "benchmark_summary.json").read_text()
+    assert "Infinity" not in serialized and "NaN" not in serialized
+    json.loads(serialized)
 
 
 def test_malformed_lines_extreme_numbers_and_grouping_fields_are_safe():
