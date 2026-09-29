@@ -4,7 +4,9 @@ from .datasets import smoke_documents
 from .metrics import cosine_similarity, mrr_at_k, recall_at_k
 
 
-def run_smoke() -> dict[str, float | bool | str]:
+def run_smoke(dataset: str = "vidore") -> dict[str, float | bool | str]:
+    if dataset != "vidore":
+        raise ValueError(f"Vidore-only smoke does not support dataset={dataset!r}")
     docs = smoke_documents()
     vectors = [[1.0, 0.0], [0.0, 1.0]]
     q = [0.8, 0.2]

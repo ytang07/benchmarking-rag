@@ -65,8 +65,12 @@ def _answer_list(acceptable_answers) -> list[str]:
     if acceptable_answers is None:
         return []
     if isinstance(acceptable_answers, str):
-        return [acceptable_answers]
-    return [str(answer) for answer in acceptable_answers if str(answer).strip()]
+        return [acceptable_answers] if acceptable_answers.strip() else []
+    if isinstance(acceptable_answers, (list, tuple)) and all(
+        isinstance(answer, str) for answer in acceptable_answers
+    ):
+        return [answer for answer in acceptable_answers if answer.strip()]
+    return []
 
 
 def _token_f1(prediction: str, reference: str) -> float:
@@ -108,6 +112,8 @@ def answer_metrics(
         result["normalized_exact_match"] = any(
             normalized_text(generated) == normalized_text(expected) for expected in answers
         )
+        result["normalized_exact_match_method"] = "normalized_text_equality_limited_secondary_check"
+        result["normalized_exact_match_scope"] = "vidore_native"
     else:
         result["correctness"] = {
             "value": None,
@@ -126,6 +132,10 @@ def answer_metrics(
             result["normalized_exact_match"] = normalized_text(generated) == normalized_text(
                 reference
             )
+            result["normalized_exact_match_method"] = (
+                "normalized_text_equality_limited_secondary_check"
+            )
+            result["normalized_exact_match_scope"] = "legacy_fallback_not_vidore_native"
     result["answer_relevance"] = {
         "value": None,
         "available": False,

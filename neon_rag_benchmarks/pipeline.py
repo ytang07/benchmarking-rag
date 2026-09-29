@@ -8,7 +8,7 @@ from uuid import uuid4
 from . import db
 from .config import BenchmarkConfig, MODELS
 from .datasets import PreparedData, json_safe, load_optional, prepare_records, smoke_documents
-from .embeddings import embed_query, embed_texts
+from .embeddings import embed_query, embed_texts, warm_model
 from .gateway import answer
 from .metrics import answer_metrics, exact_cosine_search, mrr_at_k, parse_citations, recall_at_k
 from .schema import validate_vectors
@@ -33,20 +33,24 @@ def _document_id(chunk_id: str) -> str:
 
 def _native_answers(query: dict):
     """Prefer non-empty raw answers, falling back to the native answer field."""
+
+    def normalized(value):
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        if isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
+            values = [item.strip() for item in value if item.strip()]
+            return values or None
+        return None
+
     raw_answers = query.get("raw_answers")
-    if isinstance(raw_answers, (list, tuple)):
-        normalized_raw = [answer for answer in raw_answers if str(answer).strip()]
-        if normalized_raw:
-            return normalized_raw
-    elif raw_answers is not None and str(raw_answers).strip():
-        return raw_answers
-    answer_value = query.get("answer")
-    if answer_value is not None and str(answer_value).strip():
+    normalized_raw = normalized(raw_answers)
+    if normalized_raw is not None:
+        return normalized_raw
+    answer_value = normalized(query.get("answer"))
+    if answer_value is not None:
         return answer_value
-    answers = query.get("answers")
-    if isinstance(answers, (list, tuple)):
-        answers = [answer for answer in answers if str(answer).strip()]
-    return answers if answers else None
+    return normalized(query.get("answers"))
 
 
 def _persist(path: str, records: list[dict]) -> None:
@@ -83,6 +87,7 @@ def _skip_records(
                 "hnsw_search": 0.0,
                 "exact_scan": 0.0,
                 "answer": 0.0,
+                "initialization": 0.0,
                 "total": 0.0,
             },
         }
@@ -100,6 +105,10 @@ def _run_benchmark(
     _connection=None,
 ) -> list[dict]:
     """Run one dataset/model and emit one result for the configured chat model."""
+    if data.dataset != "vidore":
+        raise ValueError(
+            f"Vidore-only benchmark execution does not support dataset={data.dataset!r}"
+        )
     if model_key not in MODELS:
         raise ValueError(f"Unknown embedding model {model_key}")
     run_id = run_id or str(uuid4())
@@ -108,6 +117,12 @@ def _run_benchmark(
         if persist:
             _persist(config.results_path, records)
         return records
+    initialization_started = perf_counter()
+    if smoke:
+        initialization_seconds = 0.0
+    else:
+        warm_model(model_key)
+        initialization_seconds = perf_counter() - initialization_started
     chunks = [
         (doc["id"] + f"#chunk-{i}", chunk, doc)
         for doc in data.documents
@@ -287,9 +302,11 @@ def _run_benchmark(
                 "exact_scan": exact_seconds,
                 "total": phase_seconds,
                 "rag_evaluation": query_embedding_seconds + hnsw_seconds + exact_seconds,
+                "initialization": initialization_seconds,
             },
             "qrel_threshold": config.qrel_min_score,
             "native_qrels": data.native_qrels,
+            "qrels": data.qrels.get(query["id"], {}),
             "evaluation_scope": data.evaluation_scope,
             "retrieval_metrics": retrieval_metrics,
             "skipped_count": len(data.skipped),
@@ -395,12 +412,18 @@ def run_matrix(
     """Execute all dataset/embedding-model/chat-model combinations."""
     if persist is None:
         persist = config.persist_results
+    selected_datasets = dataset_names or ("vidore",)
+    unsupported = [name for name in selected_datasets if name != "vidore"]
+    if unsupported:
+        raise ValueError(
+            "Vidore-only workflow accepts dataset_names containing only 'vidore'; "
+            f"unsupported dataset(s): {unsupported}"
+        )
     if not smoke:
         config.require_gateway()
     # EXPERIMENT_ID is a human label; every invocation gets a fresh immutable run id.
     run_id = str(uuid4())
     output = []
-    selected_datasets = dataset_names or ("vidore",)
     selected_models = model_keys or tuple(MODELS)
     for dataset_name in selected_datasets:
         if smoke:

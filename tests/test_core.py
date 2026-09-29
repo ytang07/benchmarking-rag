@@ -64,6 +64,14 @@ def test_offline_matrix_executes_vidore_first_paths(tmp_path):
     assert {row["chat_model"] for row in results} == {None}
 
 
+def test_public_workflow_rejects_non_vidore_datasets():
+    config = BenchmarkConfig.from_env({})
+    with pytest.raises(ValueError, match="Vidore-only workflow"):
+        run_matrix(config, smoke=True, persist=False, dataset_names=("parsebench",))
+    with pytest.raises(ValueError, match="Vidore-only smoke"):
+        run_smoke("govdocs")
+
+
 def test_chunking_is_bounded():
     assert chunk_text("abcdefgh", size=4, overlap=1) == ["abcd", "defg", "gh"]
 
@@ -74,6 +82,7 @@ def test_vector_and_answer_validation(tmp_path):
     result = answer_metrics("A correct answer!", "ok", "a correct answer")
     assert result["normalized_exact_match"] is True
     assert result["correctness"]["scope"] == "legacy_fallback_not_vidore_native"
+    assert result["normalized_exact_match_scope"] == "legacy_fallback_not_vidore_native"
     source = tmp_path / "queries.jsonl"
     source.write_text('{"query_id":"q1","text":"What?","relevant_doc_ids":"d1,d2"}\n')
     data = prepare_records(
@@ -156,12 +165,19 @@ def test_connection_is_rolled_back_and_closed_on_pipeline_failure(monkeypatch):
     monkeypatch.setattr(db, "connect", lambda _: connection)
     monkeypatch.setattr(db, "table_exists", lambda *args: False)
     monkeypatch.setattr(db, "setup", lambda *args: (_ for _ in ()).throw(RuntimeError("boom")))
-    monkeypatch.setattr(pipeline, "embed_texts", lambda texts, model: [[0.0] * 384 for _ in texts])
+    events = []
+    monkeypatch.setattr(pipeline, "warm_model", lambda model: events.append("initialize"))
+    monkeypatch.setattr(
+        pipeline,
+        "embed_texts",
+        lambda texts, model: (events.append("corpus_embedding") or [[0.0] * 384 for _ in texts]),
+    )
     config = BenchmarkConfig.from_env({"DATABASE_URL": "postgres://redacted"})
-    data = pipeline.PreparedData("parsebench", documents=[{"id": "d", "text": "text"}], queries=[])
+    data = pipeline.PreparedData("vidore", documents=[{"id": "d", "text": "text"}], queries=[])
     with pytest.raises(RuntimeError, match="boom"):
         pipeline.run_benchmark(config, data, "minilm", persist=False)
     assert connection.rolled_back and connection.closed
+    assert events == ["initialize", "corpus_embedding"]
 
 
 def test_db_cleanup_is_scoped_to_run_id():
@@ -278,12 +294,16 @@ def test_native_answer_fallback_normalizes_empty_raw_answers():
     assert pipeline._native_answers({"raw_answers": ["", "preferred"], "answer": "native"}) == [
         "preferred"
     ]
+    assert (
+        pipeline._native_answers({"raw_answers": {"bad": "shape"}, "answer": "native"}) == "native"
+    )
+    assert pipeline._native_answers({"raw_answers": ["", 3], "answer": "native"}) == "native"
 
 
 def test_exact_scan_false_does_not_report_unmeasured_exact_metrics():
     config = BenchmarkConfig.from_env({"EXACT_SCAN": "false"})
     data = pipeline.PreparedData(
-        "parsebench",
+        "vidore",
         documents=[{"id": "d", "text": "text"}],
         queries=[{"id": "q", "text": "text"}],
         qrels={"q": {"d": 1.0}},
@@ -409,6 +429,7 @@ def test_vidore_result_persists_answer_provenance_and_timing(tmp_path):
     assert result["retrieved_passages"][0]["document_id"] == "doc-1"
     assert result["retrieved_passages"][0]["text"] == "Evidence"
     assert result["answer_metrics"]["correctness"]["available"] is True
+    assert result["timing_seconds"]["initialization"] == 0.0
     assert result["vidore_provenance"]["corpus"]
     persisted = (tmp_path / "results.jsonl").read_text()
     assert '"arbitrary": {"value": "kept"}' in persisted
