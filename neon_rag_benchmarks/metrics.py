@@ -101,6 +101,9 @@ def answer_metrics(
         "answer_chars": len(generated),
         "answer_words": len(generated.split()),
         "quality_metric_support": "vidore_deterministic_token_f1; no LLM judge",
+        "normalized_exact_match": None,
+        "normalized_exact_match_method": None,
+        "normalized_exact_match_scope": None,
     }
     if status.lower() not in {"ok", "success"} or not generated.strip():
         reason = (
@@ -111,9 +114,6 @@ def answer_metrics(
         result.update(
             {
                 "correctness": {"value": None, "available": False, "reason": reason},
-                "normalized_exact_match": None,
-                "normalized_exact_match_method": None,
-                "normalized_exact_match_scope": None,
                 "answer_relevance": {"value": None, "available": False, "reason": reason},
                 "retrieval_passage_citation_completeness": {
                     "value": None,

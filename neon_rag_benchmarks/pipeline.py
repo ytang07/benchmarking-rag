@@ -84,7 +84,6 @@ def _skip_records(
     dataset_initialization_seconds: float = 0.0,
     model_initialization_seconds: float = 0.0,
 ) -> list[dict]:
-    evaluation_scope, evaluation_detail, provenance_scope, provenance_detail = _record_scopes(data)
     return [
         {
             "dataset": data.dataset,
@@ -97,9 +96,9 @@ def _skip_records(
             "reason": reason,
             "skipped": data.skipped,
             "evaluation_scope": "skipped",
-            "evaluation_scope_detail": evaluation_detail,
-            "provenance_scope": provenance_scope,
-            "provenance_scope_detail": provenance_detail,
+            "evaluation_scope_detail": "skipped_record",
+            "provenance_scope": "skipped",
+            "provenance_scope_detail": "skipped_record",
             "vidore_provenance": json_safe(data.native_provenance),
             "native_qrels": data.native_qrels,
             "qrels": {},

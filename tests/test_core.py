@@ -89,6 +89,10 @@ def test_vector_and_answer_validation(tmp_path):
     assert result["normalized_exact_match"] is True
     assert result["correctness"]["scope"] == "legacy_fallback_not_vidore_native"
     assert result["normalized_exact_match_scope"] == "legacy_fallback_not_vidore_native"
+    unavailable = answer_metrics("A response", "ok")
+    assert unavailable["normalized_exact_match"] is None
+    assert unavailable["normalized_exact_match_method"] is None
+    assert unavailable["normalized_exact_match_scope"] is None
     source = tmp_path / "queries.jsonl"
     source.write_text('{"query_id":"q1","text":"What?","relevant_doc_ids":"d1,d2"}\n')
     data = prepare_records(
@@ -328,16 +332,17 @@ def test_native_answer_fallback_normalizes_empty_raw_answers():
 def test_skipped_result_has_evaluation_schema(tmp_path):
     data = pipeline.PreparedData(
         "vidore",
-        evaluation_scope="bounded",
-        evaluation_scope_detail="incomplete",
-        provenance_scope="bounded",
-        provenance_scope_detail="bounded_sample",
+        evaluation_scope="complete",
+        evaluation_scope_detail="full_dataset",
+        provenance_scope="complete",
+        provenance_scope_detail="full_dataset",
     )
     config = BenchmarkConfig.from_env({"RESULTS_PATH": str(tmp_path / "results.jsonl")})
     result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=True)[0]
     assert result["status"] == "skipped"
     assert result["evaluation_scope"] == "skipped"
-    assert result["provenance_scope"] == "bounded"
+    assert result["provenance_scope"] == "skipped"
+    assert result["provenance_scope_detail"] == "skipped_record"
     assert result["answer"] is None
     assert result["citations"] == []
     assert result["retrieved_passages"] == []
