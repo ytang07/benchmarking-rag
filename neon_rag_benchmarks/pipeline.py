@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from . import db
 from .config import BenchmarkConfig, MODELS
-from .datasets import PreparedData, load_optional, prepare_records, smoke_documents
+from .datasets import PreparedData, json_safe, load_optional, prepare_records, smoke_documents
 from .embeddings import embed_query, embed_texts
 from .gateway import answer
 from .metrics import answer_metrics, exact_cosine_search, mrr_at_k, parse_citations, recall_at_k
@@ -211,12 +211,16 @@ def _run_benchmark(
                     "citation_id": citation_id,
                     "chunk_id": doc_id,
                     "document_id": document.get("id"),
+                    "doc_id": document.get("doc_id"),
+                    "corpus_id": document.get("corpus_id"),
                     "page": page,
                     "bbox": document.get("bbox", document.get("bounding_box")),
                     "evidence": document.get("evidence"),
+                    "metadata": document.get("metadata"),
                     "text": text,
                 }
             )
+        passages = [json_safe(passage) for passage in passages]
         context = "\n\n".join(
             f"[{passage['citation_id']}] {passage['text']}" for passage in passages
         )
@@ -236,11 +240,13 @@ def _run_benchmark(
             "chat_model": config.gateway_model,
             "query_id": query["id"],
             "status": "ok",
-            "native_answer": {
-                "answer": query.get("answer"),
-                "raw_answers": query.get("raw_answers", query.get("answers")),
-                "evidence": query.get("evidence"),
-            },
+            "native_answer": json_safe(
+                {
+                    "answer": query.get("answer"),
+                    "raw_answers": query.get("raw_answers", query.get("answers")),
+                    "evidence": query.get("evidence"),
+                }
+            ),
             "retrieval": {
                 "mode": retrieval_mode,
                 "hnsw_top_ids": hnsw_ids,

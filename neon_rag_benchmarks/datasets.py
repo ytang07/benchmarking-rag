@@ -253,6 +253,14 @@ def _vidore_metadata(row: dict) -> dict:
     return metadata
 
 
+def json_safe(value):
+    """Convert native dataset objects (including bytes/features) into JSON-safe values."""
+    try:
+        return json.loads(json.dumps(value, default=lambda item: repr(item), allow_nan=False))
+    except (TypeError, ValueError):
+        return repr(value)
+
+
 def _reservoir_sample(rows, limit: int, seed: int):
     """Bound memory for streaming non-Vidore rows while retaining deterministic sampling."""
     rng = random.Random(seed)
@@ -304,7 +312,17 @@ def prepare_records(
             doc_id = str(_get(row, "corpus_id", "id", "doc_id"))
             text = _get(row, "markdown", "text", "content")
             if text:
-                result.documents.append({"id": doc_id, "text": str(text), **_vidore_metadata(row)})
+                result.documents.append(
+                    json_safe(
+                        {
+                            "id": doc_id,
+                            "doc_id": _get(row, "doc_id"),
+                            "corpus_id": _get(row, "corpus_id"),
+                            "text": str(text),
+                            **_vidore_metadata(row),
+                        }
+                    )
+                )
             else:
                 result.skipped.append({"id": doc_id, "reason": "missing markdown/text"})
         retained_query_ids = set()
@@ -316,7 +334,7 @@ def prepare_records(
                 for key in ("answer", "raw_answers", "answers", "evidence", "page", "page_number"):
                     value = _get(row, key)
                     if value is not None:
-                        query[key] = value
+                        query[key] = json_safe(value)
                 result.queries.append(query)
                 retained_query_ids.add(query_id)
         qrels_seen = 0

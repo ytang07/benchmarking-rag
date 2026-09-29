@@ -46,6 +46,21 @@ def validate_citations(citations: list[str], passages: list[dict]) -> dict:
     }
 
 
+def parse_claims(answer: str) -> list[dict]:
+    """Split an answer into claims and attach citations occurring with each claim."""
+    claims = []
+    for part in re.split(r"(?<=[.!?])\s+|\n+", answer or ""):
+        citations = parse_citations(part)
+        text = _CITATION_RE.sub("", part).strip()
+        if not text and citations and claims:
+            claims[-1]["citations"].extend(
+                citation for citation in citations if citation not in claims[-1]["citations"]
+            )
+        elif text:
+            claims.append({"claim": text, "citations": citations})
+    return claims
+
+
 def _answer_list(acceptable_answers) -> list[str]:
     if acceptable_answers is None:
         return []
@@ -82,12 +97,13 @@ def answer_metrics(
         "answer_words": len(generated.split()),
         "quality_metric_support": "vidore_deterministic_token_f1; no LLM judge",
     }
-    answers = _answer_list(acceptable_answers if acceptable_answers is not None else reference)
+    answers = _answer_list(acceptable_answers)
     if answers:
         result["correctness"] = {
             "value": max(_token_f1(generated, expected) for expected in answers),
             "available": True,
             "method": "deterministic_token_f1_against_vidore_acceptable_answers",
+            "scope": "vidore_native",
         }
         result["normalized_exact_match"] = any(
             normalized_text(generated) == normalized_text(expected) for expected in answers
@@ -100,6 +116,16 @@ def answer_metrics(
         }
         result["normalized_exact_match"] = None
         result["quality_metric_note"] = "unavailable_without_vidore_acceptable_answers"
+        if reference is not None:
+            result["correctness"] = {
+                "value": _token_f1(generated, reference),
+                "available": True,
+                "method": "deterministic_token_f1_against_legacy_reference",
+                "scope": "legacy_fallback_not_vidore_native",
+            }
+            result["normalized_exact_match"] = normalized_text(generated) == normalized_text(
+                reference
+            )
     result["answer_relevance"] = {
         "value": None,
         "available": False,
@@ -107,7 +133,7 @@ def answer_metrics(
         "reason": "answer relevance requires an optional evaluator/judge",
     }
     citation_result = validate_citations(citations or [], passages or [])
-    result["citation_completeness"] = {
+    result["retrieval_passage_citation_completeness"] = {
         "value": citation_result["completeness"],
         "available": bool(passages),
         "method": "retrieved_passage_coverage",
@@ -117,22 +143,46 @@ def answer_metrics(
         "available": bool(citations),
         "method": "stable_retrieved_chunk_identifier_match",
     }
-    if citations and citation_result["cited_passages"]:
-        text = " ".join(str(p.get("text", "")) for p in citation_result["cited_passages"])
-        claims = [part.strip() for part in re.split(r"[.!?]+", generated) if part.strip()]
-        supported = [claim for claim in claims if _token_f1(claim, text) >= 0.25]
-        result["groundedness"] = {
-            "value": len(supported) / len(claims) if claims else None,
-            "available": bool(claims),
-            "method": "deterministic_claim_token_overlap_with_cited_text",
-        }
-    else:
-        result["groundedness"] = {
-            "value": None,
-            "available": False,
-            "method": "deterministic_claim_token_overlap_with_cited_text",
-            "reason": "no valid cited retrieved text",
-        }
+    claims = parse_claims(generated)
+    by_id = {
+        str(p.get("citation_id", p.get("chunk_id", p.get("id", "")))): p for p in passages or []
+    }
+    claim_results = []
+    for claim in claims:
+        valid = [citation for citation in claim["citations"] if citation in by_id]
+        cited_text = " ".join(str(by_id[citation].get("text", "")) for citation in valid)
+        grounded = bool(valid) and _token_f1(claim["claim"], cited_text) >= 0.25
+        claim_results.append(
+            {
+                "claim": claim["claim"],
+                "citations": claim["citations"],
+                "valid_citations": valid,
+                "citation_complete": bool(valid),
+                "grounded": grounded if valid else None,
+                "grounded_available": bool(valid),
+            }
+        )
+    claim_count = len(claim_results)
+    result["claims"] = claim_results
+    result["claim_level_citation_completeness"] = {
+        "value": (sum(item["citation_complete"] for item in claim_results) / claim_count)
+        if claim_count
+        else None,
+        "available": bool(claim_count),
+        "method": "factual_claims_with_at_least_one_valid_citation",
+    }
+    result["citation_completeness"] = result["claim_level_citation_completeness"]
+    grounded_values = [item["grounded"] for item in claim_results if item["grounded_available"]]
+    result["groundedness"] = {
+        "value": (sum(grounded_values) / claim_count)
+        if claim_count and len(grounded_values) == claim_count
+        else None,
+        "available": bool(claim_count and len(grounded_values) == claim_count),
+        "method": "claim_token_overlap_with_only_that_claims_cited_text",
+        "reason": None
+        if claim_count and len(grounded_values) == claim_count
+        else "one or more claims lack a valid parseable citation",
+    }
     result["citation_details"] = citation_result
     return result
 

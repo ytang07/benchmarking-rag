@@ -9,6 +9,7 @@ from neon_rag_benchmarks.metrics import (
     answer_metrics,
     exact_cosine_search,
     mrr_at_k,
+    parse_claims,
     parse_citations,
     recall_at_k,
     validate_citations,
@@ -72,6 +73,7 @@ def test_vector_and_answer_validation(tmp_path):
         validate_vectors([[1.0]], 2)
     result = answer_metrics("A correct answer!", "ok", "a correct answer")
     assert result["normalized_exact_match"] is True
+    assert result["correctness"]["scope"] == "legacy_fallback_not_vidore_native"
     source = tmp_path / "queries.jsonl"
     source.write_text('{"query_id":"q1","text":"What?","relevant_doc_ids":"d1,d2"}\n')
     data = prepare_records(
@@ -304,6 +306,7 @@ def test_vidore_native_answers_and_evidence_are_retained():
                     "markdown": "Evidence",
                     "page_number": 4,
                     "bbox": [1, 2, 3, 4],
+                    "metadata": {"native": b"bytes"},
                 }
             ],
             "queries": [
@@ -321,6 +324,7 @@ def test_vidore_native_answers_and_evidence_are_retained():
     assert data.queries[0]["raw_answers"] == ["Evidence"]
     assert data.documents[0]["page_number"] == 4
     assert data.documents[0]["bbox"] == [1, 2, 3, 4]
+    assert data.documents[0]["metadata"] == {"native": "b'bytes'"}
 
 
 def test_citation_validation_and_honest_answer_metric_availability():
@@ -337,6 +341,25 @@ def test_citation_validation_and_honest_answer_metric_availability():
     assert metrics["groundedness"]["available"] is True
 
 
+def test_claim_citations_do_not_pool_unrelated_passages_or_allow_uncited_claims():
+    passages = [
+        {"citation_id": "doc-a#chunk-0", "text": "Alpha is a color."},
+        {"citation_id": "doc-b#chunk-0", "text": "Beta is a fruit."},
+    ]
+    claims = parse_claims("Alpha is a color [doc-a#chunk-0]. Beta is a fruit.")
+    assert claims[0]["citations"] == ["doc-a#chunk-0"]
+    assert claims[1]["citations"] == []
+    metrics = answer_metrics(
+        "Alpha is a color [doc-a#chunk-0]. Beta is a fruit.",
+        "ok",
+        citations=["doc-a#chunk-0"],
+        passages=passages,
+    )
+    assert metrics["claim_level_citation_completeness"]["value"] == 0.5
+    assert metrics["groundedness"]["available"] is False
+    assert metrics["claims"][1]["grounded"] is None
+
+
 def test_vidore_result_persists_answer_provenance_and_timing(tmp_path):
     data = pipeline.PreparedData(
         "vidore",
@@ -350,6 +373,20 @@ def test_vidore_result_persists_answer_provenance_and_timing(tmp_path):
     result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=True)[0]
     assert result["answer"] is None
     assert result["retrieved_passages"][0]["page"] == 4
+    assert result["retrieved_passages"][0]["document_id"] == "doc-1"
+    assert result["retrieved_passages"][0]["text"] == "Evidence"
     assert result["answer_metrics"]["correctness"]["available"] is True
     assert result["timing_seconds"]["rag_evaluation"] >= 0
     assert '"retrieved_passages"' in (tmp_path / "results.jsonl").read_text()
+
+
+def test_notebook_is_vidore_three_model_workflow():
+    import json
+
+    notebook = json.loads(
+        (Path(__file__).parents[1] / "notebooks" / "benchmark_matrix.ipynb").read_text()
+    )
+    source = "\n".join("\n".join(cell["source"]) for cell in notebook["cells"])
+    assert "9 dataset/embedding-model" not in source
+    assert "selected_count = len(dataset_names) * len(model_keys or tuple(MODELS))" in source
+    assert "Answer relevance is unavailable without a judge" in source
