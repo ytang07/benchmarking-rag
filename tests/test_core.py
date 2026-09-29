@@ -4,7 +4,12 @@ import pytest
 from neon_rag_benchmarks.config import BenchmarkConfig, MODELS
 from neon_rag_benchmarks import db
 from neon_rag_benchmarks import pipeline
-from neon_rag_benchmarks.datasets import _extract_pdf, prepare_records, validate_record
+from neon_rag_benchmarks.datasets import (
+    _extract_pdf,
+    load_optional,
+    prepare_records,
+    validate_record,
+)
 from neon_rag_benchmarks.metrics import (
     answer_metrics,
     exact_cosine_search,
@@ -91,22 +96,13 @@ def test_vector_and_answer_validation(tmp_path):
     assert result["normalized_exact_match_scope"] == "legacy_fallback_not_vidore_native"
     unavailable = answer_metrics("A response", "ok")
     assert unavailable["normalized_exact_match"] is None
-    assert unavailable["normalized_exact_match_method"] is None
-    assert unavailable["normalized_exact_match_scope"] is None
-    source = tmp_path / "queries.jsonl"
-    source.write_text('{"query_id":"q1","text":"What?","relevant_doc_ids":"d1,d2"}\n')
-    data = prepare_records(
-        "parsebench", [{"id": "d1", "text_content": "text"}], query_source=str(source)
-    )
-    assert data.queries[0]["id"] == "q1" and set(data.qrels["q1"]) == {"d1", "d2"}
-    object_source = tmp_path / "queries.json"
-    object_source.write_text(
-        '{"queries":[{"query_id":"q2","text":"Why?"}],"qrels":{"q2":{"d3":2}}}'
-    )
-    object_data = prepare_records(
-        "parsebench", [{"id": "d3", "text_content": "text"}], query_source=str(object_source)
-    )
-    assert object_data.qrels == {"q2": {"d3": 2.0}}
+    assert unavailable["normalized_exact_match_method"] == "unavailable"
+    assert unavailable["normalized_exact_match_scope"] == "not_evaluated"
+    assert unavailable["normalized_exact_match_reason"]
+    with pytest.raises(ValueError, match="Vidore-only record preparation"):
+        prepare_records("parsebench", [])
+    with pytest.raises(ValueError, match="Vidore-only dataset loading"):
+        load_optional("govdocs")
     with pytest.raises(ValueError, match="raw PDF exceeds"):
         _extract_pdf({"bytes": b"too large"}, max_bytes=2)
     assert validate_record("govdocs", {"id": "x", "broken_pdf": "false"}) == "x"
@@ -114,41 +110,11 @@ def test_vector_and_answer_validation(tmp_path):
         validate_record("govdocs", {"id": "x", "broken_pdf": "unknown"})
 
 
-def test_govdocs_cumulative_raw_budget_and_nested_pdf_shape():
-    from pypdf import PdfWriter
-    import io
-
-    writer = PdfWriter()
-    writer.add_blank_page(width=72, height=72)
-    buffer = io.BytesIO()
-    writer.write(buffer)
-    valid_pdf = buffer.getvalue()
-    data = prepare_records(
-        "govdocs",
-        [
-            {"id": "a", "broken_pdf": "false", "pdf": {"data": valid_pdf}},
-            {"id": "b", "broken_pdf": 0, "pdf": {"bytes": valid_pdf}},
-        ],
-        max_documents=10,
-        max_bytes=len(valid_pdf) + 1,
-        pdf_max_document_bytes=len(valid_pdf) + 1,
-    )
-    assert data.metadata["raw_pdf_bytes_consumed"] == len(valid_pdf)
-    assert data.metadata["raw_pdf_budget_exhausted"] is True
-    assert any("cumulative raw PDF byte budget" in item["reason"] for item in data.skipped)
-
-
-def test_malformed_pdf_is_a_stable_document_skip():
-    data = prepare_records(
-        "govdocs",
-        [{"id": "bad", "broken_pdf": False, "pdf": {"bytes": b"not pdf"}}],
-        max_bytes=100,
-        pdf_max_document_bytes=100,
-    )
-    assert any(
-        item["id"] == "bad" and item["reason"].startswith("malformed PDF bytes")
-        for item in data.skipped
-    )
+def test_non_vidore_public_dataset_boundaries_reject_before_adapters():
+    with pytest.raises(ValueError, match="Vidore-only record preparation"):
+        prepare_records("govdocs", [])
+    with pytest.raises(ValueError, match="Vidore-only dataset loading"):
+        load_optional("parsebench")
 
 
 def test_run_id_is_fresh_even_with_reused_experiment_label():
@@ -283,7 +249,7 @@ def test_vidore_bounded_sample_renames_metrics_and_preserves_retained_qrels():
         ],
     }
     data = prepare_records("vidore", raw, max_rows=1)
-    assert data.metadata["evaluation_scope"] == "bounded_sample"
+    assert data.metadata["evaluation_scope_detail"] == "bounded_sample"
     assert data.evaluation_scope == "bounded" and data.native_qrels is True
     assert data.evaluation_scope_detail == "bounded_sample"
     assert data.provenance_scope == "bounded"

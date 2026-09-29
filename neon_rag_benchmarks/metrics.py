@@ -102,8 +102,9 @@ def answer_metrics(
         "answer_words": len(generated.split()),
         "quality_metric_support": "vidore_deterministic_token_f1; no LLM judge",
         "normalized_exact_match": None,
-        "normalized_exact_match_method": None,
-        "normalized_exact_match_scope": None,
+        "normalized_exact_match_method": "unavailable",
+        "normalized_exact_match_scope": "not_evaluated",
+        "normalized_exact_match_reason": "Vidore acceptable answers unavailable",
     }
     if status.lower() not in {"ok", "success"} or not generated.strip():
         reason = (
@@ -111,6 +112,7 @@ def answer_metrics(
             if status.lower() not in {"ok", "success"}
             else "generated answer is blank"
         )
+        result["normalized_exact_match_reason"] = reason
         result.update(
             {
                 "correctness": {"value": None, "available": False, "reason": reason},
@@ -150,6 +152,7 @@ def answer_metrics(
         )
         result["normalized_exact_match_method"] = "normalized_text_equality_limited_secondary_check"
         result["normalized_exact_match_scope"] = "vidore_native"
+        result["normalized_exact_match_reason"] = "evaluated_against_vidore_acceptable_answers"
     else:
         result["correctness"] = {
             "value": None,
@@ -172,6 +175,7 @@ def answer_metrics(
                 "normalized_text_equality_limited_secondary_check"
             )
             result["normalized_exact_match_scope"] = "legacy_fallback_not_vidore_native"
+            result["normalized_exact_match_reason"] = "evaluated_against_legacy_reference_fallback"
     result["answer_relevance"] = {
         "value": None,
         "available": False,

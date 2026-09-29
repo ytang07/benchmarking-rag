@@ -87,6 +87,8 @@ def load_optional(
     govdocs_split: str = "train",
 ):
     """Load a bounded live sample; credentials/network are required by Hugging Face."""
+    if name != "vidore":
+        raise ValueError(f"Vidore-only dataset loading does not support dataset={name!r}")
     try:
         from datasets import load_dataset
     except ImportError as exc:
@@ -323,8 +325,8 @@ def prepare_records(
     pdf_max_text_bytes: int = 1_000_000,
 ) -> PreparedData:
     """Normalize a bounded HF result and record honest skips instead of inventing text/queries."""
-    if name not in DATASET_INFO:
-        raise ValueError(f"Unknown dataset {name}; choose {tuple(DATASET_INFO)}")
+    if name != "vidore":
+        raise ValueError(f"Vidore-only record preparation does not support dataset={name!r}")
     result = PreparedData(name)
     if name == "vidore":
         if not isinstance(raw, dict) or not all(
@@ -426,7 +428,6 @@ def prepare_records(
         else:
             result.provenance_scope = "complete"
             result.provenance_scope_detail = "full_dataset"
-        result.metadata["evaluation_scope"] = result.evaluation_scope_detail
         result.metadata["evaluation_scope_detail"] = result.evaluation_scope_detail
         result.metadata["provenance_scope"] = result.provenance_scope
         result.metadata["provenance_scope_detail"] = result.provenance_scope_detail
