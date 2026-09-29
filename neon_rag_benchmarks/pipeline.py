@@ -118,6 +118,7 @@ def _skip_records(
             "judge": {
                 "status": "unavailable",
                 "available": False,
+                "value": None,
                 "model": config.judge_model,
                 "reason": "benchmark record was skipped",
             },
@@ -378,13 +379,19 @@ def _run_benchmark(
             "judge": {
                 "status": "unavailable",
                 "available": False,
+                "value": None,
                 "model": config.judge_model,
                 "reason": "LLM_JUDGE_ENABLED=false",
             },
         }
         if not config.exact_scan:
             record["exact_unavailable_reason"] = "EXACT_SCAN=false"
-        if not config.gateway_model or not config.gateway_base_url or not config.gateway_token:
+        if (
+            smoke
+            or not config.gateway_model
+            or not config.gateway_base_url
+            or not config.gateway_token
+        ):
             record["answer"] = None
             record["citations"] = []
             record["answer_metrics"] = answer_metrics(
@@ -434,7 +441,9 @@ def _run_benchmark(
                 record["answer_metrics"]["reason"] = str(exc)
             record["timing_seconds"]["answer"] = perf_counter() - answer_started
         judge_started = perf_counter()
-        if not config.judge_enabled:
+        if smoke:
+            record["judge"]["reason"] = "smoke mode disables gateway answer and judge calls"
+        elif not config.judge_enabled:
             record["judge"]["reason"] = "LLM_JUDGE_ENABLED=false"
         elif not config.gateway_base_url or not config.gateway_token:
             record["judge"]["reason"] = "gateway base URL or token not configured"
@@ -453,6 +462,7 @@ def _run_benchmark(
                 record["judge"] = {
                     "status": "ok",
                     "available": True,
+                    "value": judged["score"],
                     "model": config.judge_model,
                     **judged,
                 }
@@ -469,6 +479,7 @@ def _run_benchmark(
                 record["judge"] = {
                     "status": "error",
                     "available": False,
+                    "value": None,
                     "model": config.judge_model,
                     "reason": str(exc),
                 }

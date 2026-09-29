@@ -29,9 +29,9 @@ def test_config_and_model_dimensions():
     c = BenchmarkConfig.from_env({"HNSW_M": "20"})
     assert c.hnsw_m == 20
     assert MODELS["nomic"][1] == 768
-    assert c.judge_enabled is True
+    assert c.judge_enabled is False
     assert c.judge_model == "system.ai.qwen35-122b-a10b"
-    assert BenchmarkConfig.from_env({"LLM_JUDGE_ENABLED": "false"}).judge_enabled is False
+    assert BenchmarkConfig.from_env({"LLM_JUDGE_ENABLED": "true"}).judge_enabled is True
 
 
 def test_schema_is_dimension_safe():
@@ -567,13 +567,22 @@ def test_judge_output_is_structured_and_validated(monkeypatch):
     }
 
 
-def test_judge_is_recorded_with_mocked_gateway_and_preserves_deterministic_metrics(monkeypatch):
-    data = pipeline.PreparedData(
-        "vidore",
-        documents=[{"id": "doc-1", "text": "Evidence"}],
-        queries=[{"id": "q-1", "text": "What?", "raw_answers": ["Evidence"]}],
-        qrels={"q-1": {"doc-1": 1.0}},
-    )
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not json",
+        '{"score": 0.5, "label": "relevant"}',
+        '{"score": "0.5", "label": "relevant", "rationale": "ok"}',
+        '{"score": 1.1, "label": "relevant", "rationale": "ok"}',
+        '{"score": 0.5, "label": "relevant", "rationale": "ok", "extra": true}',
+    ],
+)
+def test_judge_output_rejects_invalid_shapes(raw):
+    with pytest.raises(ValueError):
+        gateway._parse_judge_output(raw)
+
+
+def test_smoke_with_credentials_never_calls_gateways(monkeypatch):
     config = BenchmarkConfig.from_env(
         {
             "DATABRICKS_BASE_URL": "https://gateway",
@@ -581,21 +590,18 @@ def test_judge_is_recorded_with_mocked_gateway_and_preserves_deterministic_metri
             "DATABRICKS_MODEL": "answer-model",
         }
     )
-    monkeypatch.setattr(pipeline, "answer", lambda *args: "Evidence")
+    monkeypatch.setattr(pipeline, "answer", lambda *args: (_ for _ in ()).throw(AssertionError()))
     monkeypatch.setattr(
-        pipeline,
-        "judge_answer",
-        lambda *args: {"score": 1.0, "label": "relevant", "rationale": "Matches."},
+        pipeline, "judge_answer", lambda *args: (_ for _ in ()).throw(AssertionError())
     )
-    result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=False)[0]
-    assert result["judge"]["status"] == "ok"
-    assert result["judge"]["model"] == "system.ai.qwen35-122b-a10b"
-    assert result["answer_metrics"]["answer_relevance"]["value"] == 1.0
-    assert result["answer_metrics"]["correctness"]["value"] == 1.0
-    assert result["answer_metrics"]["normalized_exact_match"] is True
+    results = pipeline.run_matrix(config, smoke=True, persist=False)
+    assert len(results) == 3
+    assert all(result["answer"] is None for result in results)
+    assert all(result["judge"]["status"] == "unavailable" for result in results)
+    assert all(result["judge"]["value"] is None for result in results)
 
 
-def test_judge_failure_is_explicit_and_does_not_fabricate_score(monkeypatch):
+def test_smoke_judge_is_unavailable_and_does_not_fabricate_score(monkeypatch):
     data = pipeline.PreparedData(
         "vidore",
         documents=[{"id": "doc-1", "text": "Evidence"}],
@@ -614,9 +620,9 @@ def test_judge_failure_is_explicit_and_does_not_fabricate_score(monkeypatch):
         pipeline, "judge_answer", lambda *args: (_ for _ in ()).throw(ValueError("bad JSON"))
     )
     result = pipeline.run_benchmark(config, data, "minilm", smoke=True, persist=False)[0]
-    assert result["judge"]["status"] == "error"
+    assert result["judge"]["status"] == "unavailable"
+    assert result["judge"]["value"] is None
     assert result["answer_metrics"]["answer_relevance"]["value"] is None
-    assert result["answer_metrics"]["correctness"]["value"] == 1.0
 
 
 def test_prepared_scope_downgrades_complete_when_skipped_rows_are_present():

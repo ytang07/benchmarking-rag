@@ -7,6 +7,28 @@ def _content(response) -> str:
     return response.choices[0].message.content or ""
 
 
+def _parse_judge_output(raw: str) -> dict:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("judge returned invalid JSON") from exc
+    expected_keys = {"score", "label", "rationale"}
+    if not isinstance(parsed, dict):
+        raise ValueError("judge output must be a JSON object")
+    if set(parsed) != expected_keys:
+        raise ValueError("judge output must contain exactly score, label, and rationale")
+    score = parsed["score"]
+    label = parsed["label"]
+    rationale = parsed["rationale"]
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
+        raise ValueError("judge score must be a number between 0 and 1")
+    if label not in {"irrelevant", "partial", "relevant"}:
+        raise ValueError("judge label is invalid")
+    if not isinstance(rationale, str) or not rationale.strip():
+        raise ValueError("judge rationale must be a non-empty string")
+    return {"score": float(score), "label": label, "rationale": rationale.strip()}
+
+
 def answer(question: str, context: str, model: str, base_url: str, token: str) -> str:
     try:
         from openai import OpenAI
@@ -60,20 +82,4 @@ def judge_answer(
             },
         ],
     )
-    raw = _content(response).strip()
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError("judge returned invalid JSON") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError("judge output must be a JSON object")
-    score = parsed.get("score")
-    label = parsed.get("label")
-    rationale = parsed.get("rationale")
-    if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
-        raise ValueError("judge score must be a number between 0 and 1")
-    if label not in {"irrelevant", "partial", "relevant"}:
-        raise ValueError("judge label is invalid")
-    if not isinstance(rationale, str) or not rationale.strip():
-        raise ValueError("judge rationale must be a non-empty string")
-    return {"score": float(score), "label": label, "rationale": rationale.strip()}
+    return _parse_judge_output(_content(response).strip())

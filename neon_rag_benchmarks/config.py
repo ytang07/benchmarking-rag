@@ -43,7 +43,7 @@ class BenchmarkConfig:
     govdocs_max_document_bytes: int = 100_000_000
     govdocs_max_text_bytes: int = 1_000_000
     experiment_id: str | None = None
-    judge_enabled: bool = True
+    judge_enabled: bool = False
     judge_model: str = DEFAULT_JUDGE_MODEL
 
     @classmethod
@@ -82,7 +82,7 @@ class BenchmarkConfig:
         persist_raw = e.get("PERSIST_RESULTS", "true").strip().lower()
         if persist_raw not in {"true", "false", "1", "0", "yes", "no"}:
             raise ValueError("PERSIST_RESULTS must be true/false")
-        judge_raw = e.get("LLM_JUDGE_ENABLED", e.get("JUDGE_ENABLED", "true")).strip().lower()
+        judge_raw = e.get("LLM_JUDGE_ENABLED", e.get("JUDGE_ENABLED", "false")).strip().lower()
         if judge_raw not in {"true", "false", "1", "0", "yes", "no"}:
             raise ValueError("LLM_JUDGE_ENABLED must be true/false")
         return cls(
