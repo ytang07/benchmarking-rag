@@ -428,7 +428,6 @@ def prepare_records(
             result.provenance_scope = "complete"
             result.provenance_scope_detail = "full_dataset"
         result.metadata["evaluation_scope_detail"] = result.evaluation_scope_detail
-        result.metadata["provenance_scope"] = result.provenance_scope
         result.metadata["provenance_scope_detail"] = result.provenance_scope_detail
     else:
         if name == "parsebench":

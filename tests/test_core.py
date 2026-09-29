@@ -265,6 +265,8 @@ def test_vidore_bounded_sample_renames_metrics_and_preserves_retained_qrels():
     assert "bounded_sample_hnsw_recall@k" in metrics
     assert "native_hnsw_recall@k" not in metrics
     assert result[0]["provenance_scope"] == "bounded"
+    assert "evaluation_scope" not in result[0]["dataset_metadata"]
+    assert "provenance_scope" not in result[0]["dataset_metadata"]
 
 
 def test_non_truncated_filtered_vidore_rows_downgrade_provenance_scope():
@@ -283,6 +285,11 @@ def test_non_truncated_filtered_vidore_rows_downgrade_provenance_scope():
     assert data.provenance_scope_detail == "filtered_rows"
     assert len(data.native_provenance["corpus"]) == 2
     assert len(data.native_provenance["queries"]) == 2
+    result = pipeline.run_benchmark(
+        BenchmarkConfig.from_env({}), data, "minilm", smoke=True, persist=False
+    )[0]
+    assert "evaluation_scope" not in result["dataset_metadata"]
+    assert "provenance_scope" not in result["dataset_metadata"]
 
 
 def test_retrieval_prefix_uses_effective_scopes_after_late_or_inconsistent_changes():
@@ -497,6 +504,8 @@ def test_vidore_result_persists_answer_provenance_and_timing(tmp_path):
     persisted = (tmp_path / "results.jsonl").read_text()
     assert '"arbitrary": {"value": "kept"}' in persisted
     assert result["timing_seconds"]["rag_evaluation"] >= 0
+    assert "evaluation_scope" not in result["dataset_metadata"]
+    assert "provenance_scope" not in result["dataset_metadata"]
     assert '"retrieved_passages"' in (tmp_path / "results.jsonl").read_text()
 
 
